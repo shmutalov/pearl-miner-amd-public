@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Logs
+*.log
+
+# Local-only: wallet address(es) for live runs
+wallet.txt
