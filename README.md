@@ -138,9 +138,6 @@ hardware is just slow for this workload.
   spec-quality test vectors.
 - The Decred developers for the consensus / SPV building blocks Pearl
   builds on.
-- The original `alpha-miner` v6 binary, RE'd under Docker (see
-  `re/scripts/`) to confirm wire format and a couple of kernel-naming
-  conventions.
 
 ## License
 
