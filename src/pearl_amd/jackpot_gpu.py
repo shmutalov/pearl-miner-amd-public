@@ -41,27 +41,34 @@ except Exception:  # pragma: no cover — pyopencl missing or no GPU
 _KERNELS_DIR = Path(__file__).resolve().parent.parent / "kernels"
 _KERNEL_PATH = _KERNELS_DIR / "jackpot_search.cl"
 _KERNEL_PATH_RDNA3 = _KERNELS_DIR / "jackpot_search_rdna3.cl"
+_KERNEL_PATH_RDNA3_WTILE = _KERNELS_DIR / "jackpot_search_rdna3_wtile.cl"
 
 
 def _select_kernel_path(device: cl.Device, variant: str) -> Path:
     """Pick the kernel source for ``variant``.
 
-    ``"auto"`` uses the RDNA3-tuned kernel on wave32 RDNA parts
-    (gfx10xx/gfx11xx/gfx12xx), which is bit-identical to the original but
-    computes the noisy pa/pb operand strips once per outer iter instead of
-    redundantly per thread. ``"polaris"`` forces the original GCN kernel;
-    ``"rdna3"`` forces the new one.
+    All three kernels are bit-identical; they differ only in how the noisy
+    GEMM is mapped to the hardware. ``"polaris"`` is the original GCN kernel
+    (each thread recomputes its noise). ``"rdna3"`` builds the pa/pb operand
+    strips once per outer iter in LDS. ``"rdna3_wtile"`` additionally tiles
+    the w dimension so the LDS footprint drops far enough to raise occupancy
+    (the kernel is gather/latency-bound, so more resident waves win).
+
+    ``"auto"`` selects ``rdna3_wtile`` on wave32 RDNA parts
+    (gfx10xx/gfx11xx/gfx12xx), else the GCN kernel.
     """
     variant = variant.lower()
     if variant == "polaris":
         return _KERNEL_PATH
     if variant == "rdna3":
         return _KERNEL_PATH_RDNA3
+    if variant == "rdna3_wtile":
+        return _KERNEL_PATH_RDNA3_WTILE
     if variant != "auto":
         raise ValueError(f"unknown kernel variant {variant!r}")
     name = (device.name or "").lower()
     is_rdna = any(name.startswith(g) for g in ("gfx10", "gfx11", "gfx12"))
-    return _KERNEL_PATH_RDNA3 if is_rdna else _KERNEL_PATH
+    return _KERNEL_PATH_RDNA3_WTILE if is_rdna else _KERNEL_PATH
 
 
 def _ensure_int8_contiguous(arr: np.ndarray, name: str) -> np.ndarray:
@@ -104,6 +111,11 @@ class JackpotGpu:
             f"-D PEARL_W={w}",
             f"-D PEARL_R={r}",
         ]
+        if self.kernel_path == _KERNEL_PATH_RDNA3_WTILE:
+            # Largest w-tile count in {4,2,1} that divides w. 4 is the measured
+            # occupancy sweet spot on gfx1100; the kernel requires w % ntiles == 0.
+            self.ntiles_w = next(t for t in (4, 2, 1) if w % t == 0)
+            build_opts.append(f"-D PEARL_NTILES_W={self.ntiles_w}")
         self.program = cl.Program(self.context, src).build(options=build_opts)
         self.kernel = self.program.jackpot_evaluate_batch
 

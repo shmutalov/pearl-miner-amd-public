@@ -40,10 +40,12 @@ Other things you may find useful:
   encoder/decoder for `PlainProof`, plus all 6 Rust `nbits` test vectors.
 - **`src/pearl_amd/jackpot.py`** — readable port of `pearl_noise.rs` +
   `jackpot/helper.rs` (CPU oracle used to verify the GPU path).
-- **`src/kernels/*.cl`** — six OpenCL kernels:
+- **`src/kernels/*.cl`** — OpenCL kernels:
   `blake3_challenge.cl` (anti-DoS solver), `blake3_xof.cl`
   (`derive_matrix`), `blake3_merkle.cl` (chunk+layer), `pearl_noise.cl`
-  (uniform + perm noise), `jackpot_search.cl` (batched evaluator).
+  (uniform + perm noise), `jackpot_search.cl` (batched evaluator), plus
+  `jackpot_search_rdna3.cl` / `jackpot_search_rdna3_wtile.cl` (wave32
+  RDNA3 evaluators — see the RDNA3 section below).
 
 ## Project structure
 
@@ -54,7 +56,9 @@ src/
 │   ├── blake3_xof.cl
 │   ├── blake3_merkle.cl
 │   ├── pearl_noise.cl
-│   └── jackpot_search.cl
+│   ├── jackpot_search.cl
+│   ├── jackpot_search_rdna3.cl       # wave32 RDNA3 evaluator
+│   └── jackpot_search_rdna3_wtile.cl # + w-tiled for occupancy
 └── pearl_amd/              # Python host + CPU oracles
     ├── device.py           # find_gpu()
     ├── stratum_client.py   # pearl/v1 JSON-RPC client
@@ -133,24 +137,38 @@ hardware is just slow for this workload.
 
 ## RDNA3 (gfx11xx) kernel
 
-`src/kernels/jackpot_search_rdna3.cl` is a wave32-native variant of the
-jackpot evaluator, auto-selected on gfx10/11/12 parts (override with
-`JackpotGpu(..., variant="polaris"|"rdna3")`). The original GCN kernel is
-already bit-correct on RDNA3 wave32 (its final XOR tree sits exactly at
-the 32-lane boundary, after a barrier, so it never reads an
-unsynchronized subgroup — the old "different SIMD width will misbehave"
-warning was overly cautious). The speedup instead comes from
-restructuring the math: the per-candidate jackpot is the tiny GEMM
-`acc[u][v] = Σ_l (A+noise_a)[u][l]·(B+noise_b)[v][l]`, and the original
-recomputes the noisy `pa[u][l]` operand 64× (once per `v`). The RDNA3
-kernel builds the `pa`/`pb` strips cooperatively in LDS once per outer
-iter, leaving a clean char4-vectorized int8 dot product inner loop.
-Measured on an RX 7900 XT (gfx1100) at pool shape (m=n=131072, k=4096):
+Two wave32-native variants of the jackpot evaluator, auto-selected on
+gfx10/11/12 parts (override with
+`JackpotGpu(..., variant="polaris"|"rdna3"|"rdna3_wtile")`).
 
-| Kernel | cand/s |
-|---|---|
-| `jackpot_search.cl` (GCN) | ~117 000 |
-| `jackpot_search_rdna3.cl` | **~238 000** (~2.0×, bit-identical) |
+First, the GCN kernel is **already bit-correct on RDNA3 wave32** — its
+final XOR tree sits exactly at the 32-lane boundary, after a barrier, so
+it never reads an unsynchronized subgroup. The old "different SIMD width
+will misbehave" warning was overly cautious.
+
+The speedup is algorithmic, not from DP4A. The per-candidate jackpot is
+the tiny GEMM `acc[u][v] = Σ_l (A+noise_a)[u][l]·(B+noise_b)[v][l]`, and
+the GCN kernel recomputes the noisy `pa[u][l]` operand 64× (once per `v`).
+`jackpot_search_rdna3.cl` builds the `pa`/`pb` strips cooperatively in LDS
+once per outer iter, leaving a clean char4-vectorized int8 dot inner loop.
+
+That doubled the LDS footprint (17 KiB/WG) and halved occupancy — and the
+kernel is **gather/latency-bound**, so occupancy matters. `…_rdna3_wtile.cl`
+tiles the `w` dimension (default `PEARL_NTILES_W=4`) so the two big LDS
+buffers shrink to `TW·r`, dropping LDS to ~5.4 KiB/WG (~11 workgroups per
+WGP) — the measured occupancy sweet spot. Measured on an RX 7900 XT
+(gfx1100) at pool shape (m=n=131072, k=4096), all three bit-identical:
+
+| Kernel | LDS/WG | cand/s | vs GCN |
+|---|---|---|---|
+| `jackpot_search.cl` (GCN) | 9.1 KiB | ~117 000 | 1× |
+| `jackpot_search_rdna3.cl` | 17.1 KiB | ~205 000 | ~1.75× |
+| `jackpot_search_rdna3_wtile.cl` | 5.4 KiB | **~348 000** | **~3.0×** |
+
+For reference the same workload runs at ~27 000 cand/s on the RX 570
+(gfx803) the repo was first written for, so the 7900 XT lands ~13× ahead
+end-to-end — well short of its ~10× raw-FP32 edge alone, because this PoW
+is bound by sparse-permutation noise gathers, not arithmetic.
 
 ## Acknowledgements
 
