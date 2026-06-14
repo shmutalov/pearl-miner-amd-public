@@ -38,7 +38,30 @@ except Exception:  # pragma: no cover — pyopencl missing or no GPU
     _GPU_NOISE_AVAILABLE = False
 
 
-_KERNEL_PATH = Path(__file__).resolve().parent.parent / "kernels" / "jackpot_search.cl"
+_KERNELS_DIR = Path(__file__).resolve().parent.parent / "kernels"
+_KERNEL_PATH = _KERNELS_DIR / "jackpot_search.cl"
+_KERNEL_PATH_RDNA3 = _KERNELS_DIR / "jackpot_search_rdna3.cl"
+
+
+def _select_kernel_path(device: cl.Device, variant: str) -> Path:
+    """Pick the kernel source for ``variant``.
+
+    ``"auto"`` uses the RDNA3-tuned kernel on wave32 RDNA parts
+    (gfx10xx/gfx11xx/gfx12xx), which is bit-identical to the original but
+    computes the noisy pa/pb operand strips once per outer iter instead of
+    redundantly per thread. ``"polaris"`` forces the original GCN kernel;
+    ``"rdna3"`` forces the new one.
+    """
+    variant = variant.lower()
+    if variant == "polaris":
+        return _KERNEL_PATH
+    if variant == "rdna3":
+        return _KERNEL_PATH_RDNA3
+    if variant != "auto":
+        raise ValueError(f"unknown kernel variant {variant!r}")
+    name = (device.name or "").lower()
+    is_rdna = any(name.startswith(g) for g in ("gfx10", "gfx11", "gfx12"))
+    return _KERNEL_PATH_RDNA3 if is_rdna else _KERNEL_PATH
 
 
 def _ensure_int8_contiguous(arr: np.ndarray, name: str) -> np.ndarray:
@@ -56,7 +79,8 @@ class JackpotGpu:
                  context: cl.Context | None = None,
                  queue: cl.CommandQueue | None = None,
                  device: cl.Device | None = None,
-                 use_gpu_noise: bool = True) -> None:
+                 use_gpu_noise: bool = True,
+                 variant: str = "auto") -> None:
         if h * w not in (128, 64, 256, 512):
             # OpenCL kernel uses reqd_work_group_size; matching matters.
             # 128 is the pool shape; we keep an explicit allowlist to fail fast.
@@ -71,7 +95,9 @@ class JackpotGpu:
             self.queue = queue or cl.CommandQueue(context)
             self.device = device or self.queue.device
 
-        src = _KERNEL_PATH.read_text(encoding="utf-8")
+        self.kernel_path = _select_kernel_path(self.device, variant)
+        self.variant = variant
+        src = self.kernel_path.read_text(encoding="utf-8")
         build_opts = [
             "-cl-std=CL2.0",
             f"-D PEARL_H={h}",

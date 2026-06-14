@@ -125,12 +125,32 @@ hardware is just slow for this workload.
 - **No vardiff handling**: we honor whatever `share_nbits` the pool
   sends but don't adjust strategy based on it.
 - **No multi-GPU**: single device only.
-- **No native int8 dot-4**: gfx803 lacks the instruction; on RDNA2/3 or
-  Turing+ the jackpot kernel can be straight-line ported to DP4A/WMMA
-  for 3-5× more throughput (left as an exercise).
-- **Not OpenCL-portable**: tuned for AMD GCN 64-lane wavefronts;
-  wavefront-sync XOR reduce in the jackpot kernel will misbehave on
-  NVIDIA OpenCL or future AMD architectures with different SIMD width.
+- **No native int8 dot-4**: gfx803 lacks the instruction. The AMD
+  Windows OpenCL driver doesn't expose `cl_khr_integer_dot_product`
+  even on RDNA3, so DP4A isn't reachable from a clean builtin — and the
+  inner loop turns out to be *gather*-bound (sparse-permutation noise),
+  not MAC-bound, so DP4A wouldn't be the win anyway.
+
+## RDNA3 (gfx11xx) kernel
+
+`src/kernels/jackpot_search_rdna3.cl` is a wave32-native variant of the
+jackpot evaluator, auto-selected on gfx10/11/12 parts (override with
+`JackpotGpu(..., variant="polaris"|"rdna3")`). The original GCN kernel is
+already bit-correct on RDNA3 wave32 (its final XOR tree sits exactly at
+the 32-lane boundary, after a barrier, so it never reads an
+unsynchronized subgroup — the old "different SIMD width will misbehave"
+warning was overly cautious). The speedup instead comes from
+restructuring the math: the per-candidate jackpot is the tiny GEMM
+`acc[u][v] = Σ_l (A+noise_a)[u][l]·(B+noise_b)[v][l]`, and the original
+recomputes the noisy `pa[u][l]` operand 64× (once per `v`). The RDNA3
+kernel builds the `pa`/`pb` strips cooperatively in LDS once per outer
+iter, leaving a clean char4-vectorized int8 dot product inner loop.
+Measured on an RX 7900 XT (gfx1100) at pool shape (m=n=131072, k=4096):
+
+| Kernel | cand/s |
+|---|---|
+| `jackpot_search.cl` (GCN) | ~117 000 |
+| `jackpot_search_rdna3.cl` | **~238 000** (~2.0×, bit-identical) |
 
 ## Acknowledgements
 
