@@ -47,12 +47,29 @@ matching `JackpotGpu` (`set_job` derives noise via `PearlNoiseGpu` then uploads;
 `validate_vk.py` checks it **bit-identical to `JackpotGpu`** and benches it
 (987k cand/s through the Python/ctypes boundary — the DLL holds A/B/noise on the
 device, so per-call overhead is just the tiny t_rows/t_cols upload + readback).
-This is the piece that makes the 2.6x usable from the miner; wiring `search()` +
-`miner.py` is the next phase.
+This is the piece that makes the 2.6x usable from the miner.
+
+**Native search loop.** `jvk_search` enumerates valid offsets, evaluates, and
+does the LE-uint256 < target compare entirely in C++ — offsets never leave the
+process, only the winning candidate returns. `JackpotVk.search()` wraps it
+(JackpotGpu.search-compatible). Measured: a Python search loop around the same
+kernel hits ~38% overhead (the offset enumeration dominates); the native loop
+recovers it.
+
+| search loop (pool, RX 7900 XT) | cand/s |
+|---|---|
+| `JackpotGpu.search` (OpenCL kernel + Python loop) | 337k |
+| `JackpotVk.search` (Vulkan kernel + native loop) | **893k (~2.65x)** |
+
+893k is ~89% of the pure-GPU ceiling (1000k). `validate_search.py` confirms it
+returns the identical candidate to `JackpotGpu.search`.
 
 ```bash
-python validate_vk.py pool 16384   # bit-identical gate + throughput
+python validate_vk.py pool 16384    # evaluate_batch bit-identical gate + throughput
+python validate_search.py pool      # native search == OpenCL search, end-to-end throughput
 ```
+
+Wiring into `miner.py` (a `use_vulkan` flag) is the remaining integration step.
 
 ## What's here
 

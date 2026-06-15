@@ -198,16 +198,10 @@ static int ensureBatch(Ctx* c, int batch) {
     return 0;
 }
 
-// Evaluate `batch` candidates; out_hashes must hold batch*8 uint32 (=batch*32 B).
-__declspec(dllexport) int jvk_evaluate(Ctx* c, const int32_t* t_rows, const int32_t* t_cols, int batch, uint32_t* out_hashes) {
-    if (!c->jobSet) return -2;
-    if (ensureBatch(c,batch)) return -1;
+// Dispatch `batch` candidates whose offsets are already staged in trStg/tcStg;
+// hashes land in outStg. Caller fills trStg/tcStg and reads outStg.
+static int runBatch(Ctx* c, int batch) {
     VkDeviceSize idx=(VkDeviceSize)batch*4, outsz=(VkDeviceSize)batch*8*4;
-    void* m;
-    CHECK(vkMapMemory(c->dev,c->trStg.mem,0,idx,0,&m)); std::memcpy(m,t_rows,idx); vkUnmapMemory(c->dev,c->trStg.mem);
-    CHECK(vkMapMemory(c->dev,c->tcStg.mem,0,idx,0,&m)); std::memcpy(m,t_cols,idx); vkUnmapMemory(c->dev,c->tcStg.mem);
-
-    // bind all 12 buffers
     Buf* b[12]={&c->job[0],&c->job[1],&c->job[2],&c->job[3],&c->job[4],&c->job[5],
                 &c->trDev,&c->tcDev,&c->job[8],&c->job[9],&c->job[10],&c->outDev};
     VkDescriptorBufferInfo dbi[12]; VkWriteDescriptorSet wr[12]{};
@@ -215,7 +209,6 @@ __declspec(dllexport) int jvk_evaluate(Ctx* c, const int32_t* t_rows, const int3
         wr[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[i].dstSet=c->ds; wr[i].dstBinding=i;
         wr[i].descriptorCount=1; wr[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo=&dbi[i];}
     vkUpdateDescriptorSets(c->dev,12,wr,0,nullptr);
-
     int32_t pc[3]={c->k,c->k,c->k};
     CHECK(vkResetCommandBuffer(c->cb,0));
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; CHECK(vkBeginCommandBuffer(c->cb,&bi));
@@ -235,8 +228,75 @@ __declspec(dllexport) int jvk_evaluate(Ctx* c, const int32_t* t_rows, const int3
     vkCmdPipelineBarrier(c->cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&mb2,0,nullptr,0,nullptr);
     VkBufferCopy bo{0,0,outsz}; vkCmdCopyBuffer(c->cb,c->outDev.buf,c->outStg.buf,1,&bo);
     CHECK(vkEndCommandBuffer(c->cb));
-    if (submitWait(c,c->cb)) return -1;
+    return submitWait(c,c->cb);
+}
+
+// Evaluate `batch` candidates; out_hashes must hold batch*8 uint32 (=batch*32 B).
+__declspec(dllexport) int jvk_evaluate(Ctx* c, const int32_t* t_rows, const int32_t* t_cols, int batch, uint32_t* out_hashes) {
+    if (!c->jobSet) return -2;
+    if (ensureBatch(c,batch)) return -1;
+    VkDeviceSize idx=(VkDeviceSize)batch*4, outsz=(VkDeviceSize)batch*8*4; void* m;
+    CHECK(vkMapMemory(c->dev,c->trStg.mem,0,idx,0,&m)); std::memcpy(m,t_rows,idx); vkUnmapMemory(c->dev,c->trStg.mem);
+    CHECK(vkMapMemory(c->dev,c->tcStg.mem,0,idx,0,&m)); std::memcpy(m,t_cols,idx); vkUnmapMemory(c->dev,c->tcStg.mem);
+    if (runBatch(c,batch)) return -1;
     CHECK(vkMapMemory(c->dev,c->outStg.mem,0,outsz,0,&m)); std::memcpy(out_hashes,m,outsz); vkUnmapMemory(c->dev,c->outStg.mem);
+    return 0;
+}
+
+struct JvkHit { int32_t found; int32_t t_rows; int32_t t_cols; uint8_t hash[32]; int64_t attempts; };
+
+static inline uint64_t ld64(const uint8_t* p){ uint64_t v; std::memcpy(&v,p,8); return v; }
+static inline bool ltLE(const uint8_t* h, const uint64_t tw[4]){
+    uint64_t h3=ld64(h+24); if(h3!=tw[3])return h3<tw[3];
+    uint64_t h2=ld64(h+16); if(h2!=tw[2])return h2<tw[2];
+    uint64_t h1=ld64(h+8);  if(h1!=tw[1])return h1<tw[1];
+    return ld64(h)<tw[0];
+}
+// Step one axis (matches candidate_search.enumerate_valid_offsets).
+static inline bool axisNext(int& base,int& delta,int mod,int win,int upper,int& o){
+    while(base<upper){ int lim=(win<upper-base)?win:upper-base; if(delta<lim){o=base+delta;++delta;return true;} base+=mod; delta=0; }
+    return false;
+}
+
+// Native search: enumerate valid (t_rows,t_cols), evaluate in batches, return the
+// first hash that is < target (LE uint256). Offsets never leave the process.
+__declspec(dllexport) int jvk_search(Ctx* c,
+    int r_mod,int r_win,int r_upper, int c_mod,int c_win,int c_upper,
+    const uint8_t* target_le, int batch, int64_t max_attempts, JvkHit* out) {
+    if(!c->jobSet) return -2;
+    if(ensureBatch(c,batch)) return -1;
+    uint64_t tw[4]={ld64(target_le),ld64(target_le+8),ld64(target_le+16),ld64(target_le+24)};
+    int ra_base=0,ra_delta=0,ca_base=0,ca_delta=0,cur_tr=0; bool have_tr=false;
+    auto nextOff=[&](int& tr,int& tc)->bool{
+        for(;;){
+            if(!have_tr){ if(!axisNext(ra_base,ra_delta,r_mod,r_win,r_upper,cur_tr)) return false; ca_base=0;ca_delta=0; have_tr=true; }
+            if(axisNext(ca_base,ca_delta,c_mod,c_win,c_upper,tc)){ tr=cur_tr; return true; }
+            have_tr=false;
+        }
+    };
+    out->found=0; out->attempts=0;
+    std::vector<int32_t> hr(batch), hc(batch);
+    int64_t attempts=0;
+    for(;;){
+        int remaining = (max_attempts>0) ? (int)((max_attempts-attempts < batch) ? (max_attempts-attempts) : batch) : batch;
+        if(remaining<=0) break;
+        int cnt=0; int tr,tc;
+        for(; cnt<remaining; ++cnt){ if(!nextOff(tr,tc)) break; hr[cnt]=tr; hc[cnt]=tc; }
+        if(cnt==0) break;
+        void* m;
+        CHECK(vkMapMemory(c->dev,c->trStg.mem,0,(VkDeviceSize)cnt*4,0,&m)); std::memcpy(m,hr.data(),(size_t)cnt*4); vkUnmapMemory(c->dev,c->trStg.mem);
+        CHECK(vkMapMemory(c->dev,c->tcStg.mem,0,(VkDeviceSize)cnt*4,0,&m)); std::memcpy(m,hc.data(),(size_t)cnt*4); vkUnmapMemory(c->dev,c->tcStg.mem);
+        if(runBatch(c,cnt)) return -1;
+        uint8_t* hp; CHECK(vkMapMemory(c->dev,c->outStg.mem,0,(VkDeviceSize)cnt*32,0,(void**)&hp));
+        int hit=-1;
+        for(int i=0;i<cnt;++i){ if(ltLE(hp+(size_t)i*32,tw)){hit=i;break;} }
+        if(hit>=0){ out->found=1; out->t_rows=hr[hit]; out->t_cols=hc[hit];
+            std::memcpy(out->hash,hp+(size_t)hit*32,32); out->attempts=attempts+hit+1;
+            vkUnmapMemory(c->dev,c->outStg.mem); return 0; }
+        vkUnmapMemory(c->dev,c->outStg.mem);
+        attempts+=cnt;
+    }
+    out->attempts=attempts;
     return 0;
 }
 

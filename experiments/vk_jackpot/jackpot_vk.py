@@ -7,12 +7,18 @@ JackpotGpu.set_job (derives noise via PearlNoiseGpu, then uploads).
 """
 from __future__ import annotations
 import ctypes as C
-from ctypes import c_void_p, c_int, c_double, POINTER, c_int8, c_int32, c_uint32
+from ctypes import (c_void_p, c_int, c_double, POINTER, byref,
+                    c_int8, c_int32, c_uint32, c_int64, c_uint8)
 from pathlib import Path
 import numpy as np
 
 _DIR = Path(__file__).resolve().parent
 _DLL = _DIR / "jackpot_vk.dll"
+
+
+class JvkHit(C.Structure):
+    _fields_ = [("found", c_int32), ("t_rows", c_int32), ("t_cols", c_int32),
+                ("hash", c_uint8 * 32), ("attempts", c_int64)]
 
 
 def _ptr(arr, ctype):
@@ -36,6 +42,9 @@ class JackpotVk:
             POINTER(c_int32), POINTER(c_int32), POINTER(c_uint32), c_int, c_int, c_int]
         self.lib.jvk_evaluate.restype = c_int
         self.lib.jvk_evaluate.argtypes = [c_void_p, POINTER(c_int32), POINTER(c_int32), c_int, POINTER(c_uint32)]
+        self.lib.jvk_search.restype = c_int
+        self.lib.jvk_search.argtypes = [c_void_p, c_int, c_int, c_int, c_int, c_int, c_int,
+                                        POINTER(c_uint8), c_int, c_int64, POINTER(JvkHit)]
         self.lib.jvk_last_gpu_ms.restype = c_double
         self.lib.jvk_last_gpu_ms.argtypes = [c_void_p]
         self.lib.jvk_destroy.argtypes = [c_void_p]
@@ -89,6 +98,35 @@ class JackpotVk:
         if rc != 0:
             raise RuntimeError(f"jvk_evaluate failed ({rc})")
         return out.view(np.uint8).reshape(batch, 32)
+
+    def search(self, mining_config, target: int, *, batch_size: int = 16384,
+               max_attempts: int | None = None):
+        """Native search: enumerate valid offsets, evaluate, return the first
+        candidate whose hash (LE uint256) < target. Returns
+        ``(Candidate_or_None, attempts, seconds)`` — matches JackpotGpu.search."""
+        import time
+        from src.pearl_amd.candidate_search import _axis_constraint, Candidate
+        rp, cp = mining_config.rows_pattern, mining_config.cols_pattern
+        r_mod, r_win = _axis_constraint(rp.shape)
+        c_mod, c_win = _axis_constraint(cp.shape)
+        r_upper = self._m - max(rp.to_list())
+        c_upper = self._n - max(cp.to_list())
+        tgt = np.frombuffer(int(target).to_bytes(32, "little"), dtype=np.uint8).copy()
+        hit = JvkHit()
+        t0 = time.time()
+        rc = self.lib.jvk_search(self.ctx, r_mod, r_win, r_upper, c_mod, c_win, c_upper,
+                                 _ptr(tgt, c_uint8), batch_size, int(max_attempts or 0), byref(hit))
+        dt = time.time() - t0
+        if rc != 0:
+            raise RuntimeError(f"jvk_search failed ({rc})")
+        if hit.found:
+            hb = bytes(hit.hash)
+            cand = Candidate(t_rows=hit.t_rows, t_cols=hit.t_cols,
+                a_rows_indices=list(rp.indices_with_offset(hit.t_rows)),
+                b_cols_indices=list(cp.indices_with_offset(hit.t_cols)),
+                hash_jackpot=hb, target_value=int.from_bytes(hb, "little"))
+            return cand, int(hit.attempts), dt
+        return None, int(hit.attempts), dt
 
     def last_gpu_ms(self) -> float:
         return float(self.lib.jvk_last_gpu_ms(self.ctx))
