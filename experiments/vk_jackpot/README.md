@@ -37,11 +37,30 @@ and `subgroupXor` helps a lot. Once the inner loop is fast (packed int8), the
 reduce is no longer the bottleneck and the subgroup advantage vanishes. Honest
 takeaway: do the int8 packing first; `subgroupXor` only matters if you don't.
 
+## Productionized: `JackpotVk` (drop-in for `JackpotGpu`)
+
+`jackpot_vk.cpp` builds to `jackpot_vk.dll` (a C ABI: create / set_job /
+evaluate / destroy, with the device + pipeline + per-job buffers persistent and
+batch buffers reused). `jackpot_vk.py` wraps it via ctypes as **`JackpotVk`**,
+matching `JackpotGpu` (`set_job` derives noise via `PearlNoiseGpu` then uploads;
+`set_job_raw` takes inputs directly; `evaluate_batch` → `(B,32)` hashes).
+`validate_vk.py` checks it **bit-identical to `JackpotGpu`** and benches it
+(987k cand/s through the Python/ctypes boundary — the DLL holds A/B/noise on the
+device, so per-call overhead is just the tiny t_rows/t_cols upload + readback).
+This is the piece that makes the 2.6x usable from the miner; wiring `search()` +
+`miner.py` is the next phase.
+
+```bash
+python validate_vk.py pool 16384   # bit-identical gate + throughput
+```
+
 ## What's here
 
 - `jackpot.comp` — GLSL port of `jackpot_search_rdna3_wtile.cl`. Compile-time
   macros: `PEARL_R`, `PEARL_NTILES_W`, `REDUCE_MODE` (0 = LDS tree, 1 =
   `subgroupXor`).
+- `jackpot_vk.cpp` / `jackpot_vk.py` / `validate_vk.py` — the DLL, ctypes
+  wrapper, and bit-identical validation (above).
 - `host.cpp` — Vulkan host (volk). Device-local SSBOs via staging, optional
   `requiredSubgroupSize` (wave32 pin), timestamp timing, readback + bit-identical
   compare against `ref.bin`.

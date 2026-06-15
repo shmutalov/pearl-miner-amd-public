@@ -1,6 +1,7 @@
 # build artifacts
 *.spv
 *.exe
+*.dll
 *.o
 # vendored at build time (build.sh fetches from github.com/zeux/volk)
 volk.h

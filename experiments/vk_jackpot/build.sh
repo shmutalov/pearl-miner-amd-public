@@ -25,7 +25,10 @@ for r in 64 128; do for nt in 4 8 16; do for red in 0 1; do
            jackpot.comp -o "jackpot_r${r}_n${nt}_red${red}.spv"
 done; done; done
 
-echo "compiling hosts..."
+echo "compiling hosts + lib..."
 "$GXX" -std=c++17 -O2 -I"$INC" -I. smoke.cpp volk.c -o smoke.exe
 "$GXX" -std=c++17 -O2 -I"$INC" -I. host.cpp  volk.c -o host.exe
+# libjackpot_vk.dll: static CRT so Python ctypes loads it without MinGW DLLs on PATH
+"$GXX" -std=c++17 -O2 -shared -static -static-libgcc -static-libstdc++ \
+       -I"$INC" -I. jackpot_vk.cpp volk.c -o jackpot_vk.dll
 echo "done."
