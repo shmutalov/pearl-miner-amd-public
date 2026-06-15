@@ -28,3 +28,17 @@ echo "compiling jackpot_vk.dll (static CRT for ctypes)..."
 "$GXX" -std=c++17 -O2 -shared -static -static-libgcc -static-libstdc++ \
        -I"$INC" -I. jackpot_vk.cpp volk.c -o jackpot_vk.dll
 echo "done -> $(pwd)/jackpot_vk.dll"
+
+# --- amortized-GEMM + cooperative_matrix path (RDNA3 tensor cores) ---
+echo "compiling coopmat shaders (pmat + jackpot_coopmat, r=64,128)..."
+for r in 64 128; do
+  "$GLSLC" --target-env=vulkan1.3 -DPEARL_R=$r pmat.comp -o "pmat_r${r}.spv"
+  # WG=256 + requiredSubgroupSize=32 (wave32) is the tuned production config.
+  "$GLSLC" --target-env=vulkan1.3 -DPEARL_R=$r -DWG=256 jackpot_coopmat.comp \
+           -o "jackpot_coopmat_r${r}_wg256.spv"
+done
+
+echo "compiling jackpot_coopmat_vk.dll (static CRT for ctypes)..."
+"$GXX" -std=c++17 -O2 -shared -static -static-libgcc -static-libstdc++ \
+       -I"$INC" -I. jackpot_coopmat_vk.cpp volk.c -o jackpot_coopmat_vk.dll
+echo "done -> $(pwd)/jackpot_coopmat_vk.dll"
