@@ -66,13 +66,15 @@ int main(int argc, char** argv){
     s8.storageBuffer8BitAccess=VK_TRUE; s8.pNext=&cmf;
     VkPhysicalDeviceShaderFloat16Int8Features fi8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
     fi8.shaderInt8=VK_TRUE; fi8.pNext=&s8;
+    VkPhysicalDeviceSubgroupSizeControlFeatures sscf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
+    sscf.subgroupSizeControl=VK_TRUE; sscf.computeFullSubgroups=VK_TRUE; sscf.pNext=&fi8;
     const char* exts[]={VK_KHR_8BIT_STORAGE_EXTENSION_NAME,VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,
-                        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
+                        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME};
     float prio=1.0f; VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex=qfi; qci.queueCount=1; qci.pQueuePriorities=&prio;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    dci.pNext=&fi8; dci.queueCreateInfoCount=1; dci.pQueueCreateInfos=&qci;
-    dci.enabledExtensionCount=3; dci.ppEnabledExtensionNames=exts;
+    dci.pNext=&sscf; dci.queueCreateInfoCount=1; dci.pQueueCreateInfos=&qci;
+    dci.enabledExtensionCount=4; dci.ppEnabledExtensionNames=exts;
     VkDevice dev; CHECK(vkCreateDevice(pd,&dci,nullptr,&dev)); volkLoadDevice(dev);
     VkQueue queue; vkGetDeviceQueue(dev,qfi,0,&queue);
 
@@ -107,6 +109,9 @@ int main(int argc, char** argv){
     VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; smci.codeSize=code.size(); smci.pCode=(const uint32_t*)code.data();
     VkShaderModule sm; CHECK(vkCreateShaderModule(dev,&smci,nullptr,&sm));
     VkPipelineShaderStageCreateInfo ss{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; ss.stage=VK_SHADER_STAGE_COMPUTE_BIT; ss.module=sm; ss.pName="main";
+    uint32_t sgSize = argc>5? (uint32_t)atoi(argv[5]) : 0;
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+    if(sgSize){ rss.requiredSubgroupSize=sgSize; ss.pNext=&rss; }
     VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO}; cpci.stage=ss; cpci.layout=pl;
     VkPipeline pipe; CHECK(vkCreateComputePipelines(dev,VK_NULL_HANDLE,1,&cpci,nullptr,&pipe));
 

@@ -61,11 +61,13 @@ static std::vector<char> readFile(const std::string& p){
 }
 static long metaInt(const std::string& s,const char* k){ std::string pat=std::string("\"")+k+"\""; size_t p=s.find(pat); if(p==std::string::npos){printf("meta missing %s\n",k);exit(1);} p=s.find(':',p)+1; return strtol(s.c_str()+p,nullptr,10); }
 
-static VkPipeline mkPipe(const std::string& spv, VkPipelineLayout pl){
+static VkPipeline mkPipe(const std::string& spv, VkPipelineLayout pl, uint32_t sgSize=0){
     auto code=readFile(spv);
     VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; smci.codeSize=code.size(); smci.pCode=(const uint32_t*)code.data();
     VkShaderModule sm; vkCreateShaderModule(dev,&smci,nullptr,&sm);
     VkPipelineShaderStageCreateInfo ss{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; ss.stage=VK_SHADER_STAGE_COMPUTE_BIT; ss.module=sm; ss.pName="main";
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+    if(sgSize){ rss.requiredSubgroupSize=sgSize; ss.pNext=&rss; }
     VkComputePipelineCreateInfo cp{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO}; cp.stage=ss; cp.layout=pl;
     VkPipeline pipe; if(vkCreateComputePipelines(dev,VK_NULL_HANDLE,1,&cp,nullptr,&pipe)!=VK_SUCCESS){printf("pipeline fail %s\n",spv.c_str());exit(1);} return pipe;
 }
@@ -78,6 +80,7 @@ int main(int argc,char** argv){
     long totalWG=nbands*nblocks;
     long wg_cnt = argc>4? atol(argv[4]) : totalWG;
     int target_lz = argc>5? atoi(argv[5]) : 0;
+    uint32_t sgSize = argc>6? (uint32_t)atoi(argv[6]) : 0;   // pin search subgroup size (0=default)
     if(wg_cnt>totalWG) wg_cnt=totalWG;
     printf("m=%ld n=%ld k=%ld r=%ld totalWG=%ld run=%ld target_lz=%d\n",M,N,K,R,totalWG,wg_cnt,target_lz);
 
@@ -92,9 +95,10 @@ int main(int argc,char** argv){
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR}; cmf.cooperativeMatrix=VK_TRUE;
     VkPhysicalDevice8BitStorageFeatures s8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES}; s8.storageBuffer8BitAccess=VK_TRUE; s8.pNext=&cmf;
     VkPhysicalDeviceShaderFloat16Int8Features fi8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES}; fi8.shaderInt8=VK_TRUE; fi8.pNext=&s8;
-    const char* exts[]={VK_KHR_8BIT_STORAGE_EXTENSION_NAME,VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME};
+    VkPhysicalDeviceSubgroupSizeControlFeatures sscf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES}; sscf.subgroupSizeControl=VK_TRUE; sscf.computeFullSubgroups=VK_TRUE; sscf.pNext=&fi8;
+    const char* exts[]={VK_KHR_8BIT_STORAGE_EXTENSION_NAME,VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME};
     float prio=1.0f; VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qci.queueFamilyIndex=qfi; qci.queueCount=1; qci.pQueuePriorities=&prio;
-    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; dci.pNext=&fi8; dci.queueCreateInfoCount=1; dci.pQueueCreateInfos=&qci; dci.enabledExtensionCount=3; dci.ppEnabledExtensionNames=exts;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; dci.pNext=&sscf; dci.queueCreateInfoCount=1; dci.pQueueCreateInfos=&qci; dci.enabledExtensionCount=4; dci.ppEnabledExtensionNames=exts;
     CHECK(vkCreateDevice(pd,&dci,nullptr,&dev)); volkLoadDevice(dev); vkGetDeviceQueue(dev,qfi,0,&queue);
     VkCommandPoolCreateInfo cpc{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cpc.queueFamilyIndex=qfi; cpc.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     CHECK(vkCreateCommandPool(dev,&cpc,nullptr,&cpool));
@@ -135,7 +139,8 @@ int main(int argc,char** argv){
     VkPushConstantRange pcrS{VK_SHADER_STAGE_COMPUTE_BIT,0,4*sizeof(int32_t)};
     VkPipelineLayoutCreateInfo plS{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; plS.setLayoutCount=1; plS.pSetLayouts=&dslS; plS.pushConstantRangeCount=1; plS.pPushConstantRanges=&pcrS;
     VkPipelineLayout plSearch; CHECK(vkCreatePipelineLayout(dev,&plS,nullptr,&plSearch));
-    VkPipeline pipeSearch=mkPipe(searchSpv,plSearch);
+    VkPipeline pipeSearch=mkPipe(searchSpv,plSearch,sgSize);
+    if(sgSize) printf("search pinned to subgroupSize=%u\n", sgSize);
 
     VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,4+4+5};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dpci.maxSets=3; dpci.poolSizeCount=1; dpci.pPoolSizes=&dps;
