@@ -44,7 +44,7 @@ echo   Pool   : %POOL_HOST%:%POOL_PORT%
 echo   Path   : coopmat (tensor cores) + submit
 echo.
 
-"%PY%" src\scripts\35_run_miner_live.py --host "%POOL_HOST%" --port %POOL_PORT% --address "%ADDRESS%" --worker "%WORKER%" --coopmat --coopmat-batch %COOPMAT_BATCH% --max-hits %MAX_HITS% --observe-seconds %OBSERVE_SECONDS% --submit
+"%PY%" src\scripts\35_run_miner_live.py --host "%POOL_HOST%" --port %POOL_PORT% --address "%ADDRESS%" --worker "%WORKER%" --coopmat --coopmat-batch %COOPMAT_BATCH% --max-hits %MAX_HITS% --observe-seconds %OBSERVE_SECONDS% --submit --coopmat-submit-threads 8 --password "x;d=3000000"
 
 echo.
 echo   Miner exited (code %ERRORLEVEL%).

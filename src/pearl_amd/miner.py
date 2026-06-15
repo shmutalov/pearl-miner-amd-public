@@ -93,20 +93,29 @@ class MinerState:
     job_matrices: JobMatrices
     A_layers: list[list[bytes]]
     B_layers: list[list[bytes]]
+    # A/B serialized to bytes, cached once per round so proof-building doesn't
+    # re-`tobytes()` the full (512 MiB at pool shape) matrices on every share.
+    a_bytes: bytes | None = None
+    b_bytes: bytes | None = None
 
 
 def build_plain_proof(jm: JobMatrices, mc: MiningConfiguration,
                       A_layers: list[list[bytes]],
                       B_layers: list[list[bytes]],
-                      candidate: Candidate) -> PlainProof:
+                      candidate: Candidate,
+                      a_bytes: bytes | None = None,
+                      b_bytes: bytes | None = None) -> PlainProof:
     """Assemble a wire-ready ``PlainProof`` from a winning candidate.
 
     Extracts the touched leaves from both matrices, walks the Merkle layers
     to collect siblings, then packages into the bincode-compatible
     ``PlainProof`` dataclass from ``plain_proof_codec``.
+
+    ``a_bytes``/``b_bytes`` may carry the matrices already serialized (constant
+    within a round, ~512 MiB each at pool shape) to skip a per-share re-copy.
     """
-    A_bytes = jm.A.tobytes()
-    B_bytes = jm.B.tobytes()
+    A_bytes = a_bytes if a_bytes is not None else jm.A.tobytes()
+    B_bytes = b_bytes if b_bytes is not None else jm.B.tobytes()
 
     a_leaf_indices = compute_leaf_indices_from_rows(candidate.a_rows_indices, jm.k)
     b_leaf_indices = compute_leaf_indices_from_rows(candidate.b_cols_indices, jm.k)
@@ -159,6 +168,8 @@ class PearlMiner:
                  use_vulkan_jackpot: bool = False,
                  use_coopmat_jackpot: bool = False,
                  coopmat_shares_per_round: int = 64,
+                 coopmat_submit_threads: int = 4,
+                 coopmat_submit_stagger: float = 0.0,
                  jackpot_batch_size: int = 8192) -> None:
         if len(miner_seed) != 32:
             raise ValueError("miner_seed must be 32 bytes")
@@ -190,6 +201,8 @@ class PearlMiner:
         self._jackpot_coopmat = None
         self._jackpot_coopmat_shape: tuple[int, int, int, int] | None = None
         self._coopmat_shares_per_round = coopmat_shares_per_round
+        self._coopmat_submit_threads = coopmat_submit_threads
+        self._coopmat_submit_stagger = coopmat_submit_stagger
         # OpenCL jackpot stays available as a fallback if Vulkan fails to build.
         self._use_gpu_jackpot = use_gpu_jackpot and _GPU_JACKPOT_AVAILABLE
         # Share one OpenCL context across the GPU helpers so device buffers
@@ -440,13 +453,43 @@ class PearlMiner:
         bounded by coopmat_shares_per_round.
 
         ``should_continue`` (() -> bool) makes the round interruptible: the
-        producer stops the sweep within ~one tile, and the consumer drops any
-        still-queued shares without submitting, so Ctrl+C is honored promptly."""
+        producer stops the sweep within ~one tile, and the consumers drop any
+        still-queued shares without submitting, so Ctrl+C is honored promptly.
+
+        The pool submit (~1 s/share, dominated by server-side verification) is
+        the host bottleneck, so the consumer is fanned out to
+        ``coopmat_submit_threads`` workers whose submits overlap (the stratum
+        client serializes only the brief socket write, not the response wait)."""
         jcoop = self._jackpot_coopmat
         t0 = time.time()
+        n_workers = max(1, self._coopmat_submit_threads)
         q: queue.Queue = queue.Queue(maxsize=64)
         err: list[BaseException] = []
+        lock = threading.Lock()
         n_submitted = [0]
+        # Optional submit pacing: a shared leaky-bucket gate that spaces submit
+        # *starts* >= submit_stagger apart across all workers, so a round's batch
+        # doesn't hit the pool as one N-wide burst. Submits still overlap (only
+        # their starts are spaced); the gate is a no-op when shares arrive slower
+        # than the spacing, so it can't throttle below the GPU's share rate.
+        pace = max(0.0, self._coopmat_submit_stagger)
+        pace_lock = threading.Lock()
+        next_slot = [0.0]
+
+        def _pace() -> None:
+            if pace <= 0.0:
+                return
+            with pace_lock:                  # claim the next slot in arrival order
+                start = max(time.monotonic(), next_slot[0])
+                next_slot[0] = start + pace
+            delay = start - time.monotonic()  # then wait for it outside the lock
+            if delay > 0:
+                time.sleep(delay)
+
+        # Serialize A/B once for the whole round; all workers reuse it read-only.
+        if state is not None and state.a_bytes is None:
+            state.a_bytes = state.job_matrices.A.tobytes()
+            state.b_bytes = state.job_matrices.B.tobytes()
 
         def _consumer() -> None:
             while True:
@@ -456,28 +499,35 @@ class PearlMiner:
                         return
                     if should_continue is not None and not should_continue():
                         continue        # stop requested: drop the rest, don't submit
+                    _pace()              # space this submit's start vs the others
                     self._submit_hit(work, state, item,
                                      jcoop.last_attempts, time.time() - t0)
-                    n_submitted[0] += 1
+                    with lock:
+                        n_submitted[0] += 1
                 except BaseException as e:  # keep producer alive; surface later
-                    if not err:
-                        err.append(e)
+                    with lock:
+                        if not err:
+                            err.append(e)
                 finally:
                     q.task_done()
 
-        worker = threading.Thread(target=_consumer, name="coopmat-submit", daemon=True)
-        worker.start()
+        workers = [threading.Thread(target=_consumer, name=f"coopmat-submit-{i}",
+                                    daemon=True) for i in range(n_workers)]
+        for w in workers:
+            w.start()
         try:
             for cand in jcoop.search_all_stream(
                     work.mining_config, work.target,
                     max_return=self._coopmat_shares_per_round,
                     should_continue=should_continue, job_slot=job_slot):
                 q.put(cand)
-                if err:                # consumer died (e.g. pool/socket error)
+                if err:                # a consumer died (e.g. pool/socket error)
                     break
         finally:
-            q.put(None)                # sentinel: drain + stop the consumer
-            worker.join()
+            for _ in workers:          # one sentinel per worker
+                q.put(None)
+            for w in workers:
+                w.join()
 
         if err:
             raise err[0]
@@ -587,7 +637,8 @@ class PearlMiner:
                    hash=hit.hash_jackpot.hex())
         t1 = time.time()
         proof = build_plain_proof(state.job_matrices, work.mining_config,
-                                  state.A_layers, state.B_layers, hit)
+                                  state.A_layers, state.B_layers, hit,
+                                  a_bytes=state.a_bytes, b_bytes=state.b_bytes)
         proof_bytes = proof.encode()
         self._emit("proof_built", proof_bytes=len(proof_bytes),
                    build_seconds=time.time() - t1)

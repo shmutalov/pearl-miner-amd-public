@@ -183,6 +183,7 @@ class StratumClient:
         self._pending: dict[int, threading.Event] = {}
         self._responses: dict[int, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()   # serializes socket writes across threads
         self._reader_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._disconnected = threading.Event()  # set when reader_loop exits (clean or error)
@@ -212,11 +213,15 @@ class StratumClient:
     def _send(self, msg: dict[str, Any]) -> None:
         assert self._sock is not None
         line = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
-        self._sock.sendall(line)
+        # Concurrent submit threads share one socket; an unlocked sendall could
+        # interleave two frames' bytes on the wire. Hold the lock only for write.
+        with self._send_lock:
+            self._sock.sendall(line)
 
     def _next_request_id(self) -> int:
-        self._next_id += 1
-        return self._next_id
+        with self._lock:               # atomic id alloc across concurrent callers
+            self._next_id += 1
+            return self._next_id
 
     # -- reader / dispatcher --------------------------------------------- #
 

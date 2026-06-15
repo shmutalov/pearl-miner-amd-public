@@ -67,7 +67,7 @@ def main() -> int:
     calls = [0]
     def boom(w, st, hit, attempts, dt):
         calls[0] += 1
-        if calls[0] == 3:
+        if calls[0] >= 3:               # >= so parallel workers can't skip the trigger
             raise RuntimeError("pool rejected")
     miner._submit_hit = boom
     raised = False
@@ -95,8 +95,24 @@ def main() -> int:
     ok_stop = len(stopped) == 0
     print(f"4 interrupt: submitted={len(stopped)} (expect 0), returned in {dt_stop*1000:.0f}ms (no hang)")
 
+    # ---- 5: submit pacing -> spaced starts (no burst), not faster than the gate ----
+    miner._coopmat_submit_stagger = 0.02       # 20 ms min gap between submit starts
+    miner._coopmat_shares_per_round = 15       # keep the test quick
+    stamps, slock = [], threading.Lock()
+    def rec_submit(w, st, hit, attempts, dt):
+        now = time.monotonic()
+        with slock:
+            stamps.append(now)
+    miner._submit_hit = rec_submit
+    miner._search_coopmat_pipelined(work, None)
+    s = sorted(stamps)
+    gaps = [s[i + 1] - s[i] for i in range(len(s) - 1)]
+    min_gap = min(gaps) if gaps else 0.0
+    ok_pace = len(s) >= 5 and min_gap >= 0.02 * 0.85   # >= ~17 ms, allowing slop
+    print(f"5 pacing  : {len(s)} submits, min start-gap {min_gap*1e3:.1f}ms (>= ~17ms): {ok_pace}")
+
     jc.close()
-    ok = ok_happy and raised and ok_exh and ok_stop
+    ok = ok_happy and raised and ok_exh and ok_stop and ok_pace
     print("PIPELINE ORCHESTRATION OK" if ok else "PIPELINE **FAILED**")
     return 0 if ok else 1
 
