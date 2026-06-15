@@ -1,17 +1,31 @@
 # pearl-miner-amd
 
-Pearl PoUW miner ported to AMD GPUs via OpenCL. Targets the **Polaris**
-generation (RX 470/480/570/580, gfx803) — the cheapest 8 GiB cards that
-nobody else wants. Just-for-fun research project.
+Pearl PoUW miner for AMD GPUs. Started on **Polaris** (RX 470/480/570/580,
+gfx803) via OpenCL — the cheapest 8 GiB cards nobody wants — and now runs the
+hot path on **RDNA3** (RX 7900 XT, gfx1100) tensor cores via Vulkan
+`cooperative_matrix`. Just-for-fun research project.
 
-> **Status:** end-to-end pipeline works against real pool stratum
-> (`eu1.alphapool.tech:5566`): handshake, BLAKE3 challenge, mining params,
-> per-job preflight, GPU candidate search, PlainProof assembly, share
-> submit. At ~26 000 candidate evaluations / second on an RX 570, this
-> can't realistically win shares against modern Turing/Ada miners on the
-> production pool's minimum difficulty (~44 000 years per share at
-> `d=20000`) — but every stage is mathematically correct and
+> **Status: it earns.** The full pipeline runs against real pool stratum
+> (`eu1.alphapool.tech:5566`) — handshake, BLAKE3 challenge, mining params,
+> per-job preflight, GPU candidate search, PlainProof assembly, share submit —
+> and **submits shares the pool accepts** (validated live: 40/40 accepted,
+> continuously). The amortized-GEMM + cooperative_matrix evaluator hits
+> **~37–38 M candidates/s on an RX 7900 XT** (~37 TH/s by the protocol's
+> `attempts × 2³² / s` metric). Every stage is mathematically correct and
 > bit-identical to the reference Rust implementation.
+>
+> Getting there required two correctness fixes that the small-shape tests had
+> masked (both now fixed + verified at the live pool's `rank=128`):
+> - **perm `noise_rank`** used `NOISE_RANGE//2` (=64) instead of `r` → wrong
+>   noise (= invalid proofs) whenever `rank ≠ 64`.
+> - **share target** is `2²⁵⁶/D = nbits_target << 32`, *not* the raw `nbits`
+>   target. Pearl credits each attempt as `H_per_attempt = 2³²` hash-equivalents,
+>   so a share is accepted when `2²⁵⁶/hash ≥ D`. Searching at the raw target was
+>   2³² too strict and found ~nothing; the scaled target makes expected
+>   candidates/share = `D` (≈ a few ms of GPU time).
+>
+> Economics are still modest — one 7900 XT is a small contributor, roughly
+> break-even on power — but it produces *accepted* shares, which is the point.
 
 ## What's interesting here
 
@@ -72,7 +86,14 @@ src/
     ├── derive_matrix_gpu.py# GPU BLAKE3 XOF host
     ├── merkle_gpu.py       # GPU Merkle layer host
     ├── pearl_noise_gpu.py  # GPU noise derivation host
-    ├── jackpot_gpu.py      # GPU batched evaluator + search
+    ├── jackpot_gpu.py      # GPU batched evaluator + search (OpenCL)
+    ├── jackpot_vk.py       # Vulkan per-candidate evaluator (--vulkan)
+    ├── jackpot_coopmat.py  # tensor-core amortized-GEMM evaluator (--coopmat)
+    ├── vk/                 # Vulkan/GLSL kernels + C-ABI DLLs (build.sh)
+    │   ├── jackpot.comp / jackpot_vk.cpp          # per-candidate Vulkan path
+    │   ├── pmat.comp                              # builds global PA/PB
+    │   ├── jackpot_coopmat.comp / *_vk.cpp        # cooperative_matrix path
+    │   └── build.sh                               # glslc + MinGW g++
     ├── blake3_challenge_gpu.py
     └── miner.py            # PearlMiner orchestrator
 scripts/
@@ -110,15 +131,25 @@ python -m venv .venv
 .venv/Scripts/python.exe src/scripts/35_run_miner_live.py \
     --address <your-prl1...-wallet> \
     --worker rx570 \
-    --password 'x;d=20000' \
     --observe-seconds 90 \
     --max-attempts-per-job 100000
 ```
 
-To actually submit shares, add `--submit`. Beware: at pool minimum
-difficulty (20 000 on alphapool.tech) finding a single share takes
-~10⁴⁴ seconds on an RX 570. This is normal — the code is correct, the
-hardware is just slow for this workload.
+On an RX 7900 XT, build the Vulkan bits once and mine on tensor cores —
+this submits accepted shares continuously (omit `d` in the password to let
+the pool's VarDiff pick the difficulty):
+
+```bash
+bash src/pearl_amd/vk/build.sh        # one-time: glslc + MinGW g++
+
+.venv/Scripts/python.exe src/scripts/35_run_miner_live.py \
+    --address <your-prl1...-wallet> --worker rx7900xt \
+    --coopmat --submit --coopmat-batch 64
+```
+
+Add `--submit` to post shares (default is dry-run). `--coopmat` routes the
+search through the tensor-core evaluator (falls back to `--vulkan`, then
+OpenCL, then CPU if unavailable).
 
 ## Limitations / what's NOT here
 
@@ -126,9 +157,13 @@ hardware is just slow for this workload.
   local Merkle+jackpot verifier. The pool does that; locally we only
   check that our `PlainProof` round-trips byte-identically through the
   bincode codec.
-- **No vardiff handling**: we honor whatever `share_nbits` the pool
-  sends but don't adjust strategy based on it.
+- **VarDiff**: we honor whatever difficulty the pool assigns (omit `d` in the
+  password) and search against the correctly-scaled share target, but don't
+  otherwise adjust strategy based on it.
 - **No multi-GPU**: single device only.
+- **Coopmat is pattern-specialized**: the tensor-core kernel hardcodes the live
+  pool's `rows=[0,32]`/`cols=[0..63]` tile geometry; other patterns fall back to
+  the Vulkan/OpenCL evaluators.
 - **No native int8 dot-4**: gfx803 lacks the instruction. The AMD
   Windows OpenCL driver doesn't expose `cl_khr_integer_dot_product`
   even on RDNA3, so DP4A isn't reachable from a clean builtin — and the
@@ -169,6 +204,49 @@ For reference the same workload runs at ~27 000 cand/s on the RX 570
 (gfx803) the repo was first written for, so the 7900 XT lands ~13× ahead
 end-to-end — well short of its ~10× raw-FP32 edge alone, because this PoW
 is bound by sparse-permutation noise gathers, not arithmetic.
+
+## Vulkan + cooperative_matrix (tensor cores) — the fast path
+
+The OpenCL kernels recompute the noisy GEMM per candidate. The AMD Windows
+OpenCL driver exposes neither subgroup arithmetic nor `cl_khr_integer_dot_product`,
+so the real win — RDNA3's WMMA units — is unreachable from OpenCL. Vulkan
+compute reaches them.
+
+Two Vulkan stages live in `src/pearl_amd/vk/` (built by `build.sh`, artifacts
+gitignored), each a ctypes drop-in selected by a miner flag:
+
+- **`jackpot_vk` (`--vulkan`)** — a straight Vulkan port of the per-candidate
+  kernel. Packing 4×int8 per `shared uint` lets LLPC fuse the inner byte-dot
+  (likely `v_dot4_i32_i8`): **~0.9 M cand/s**, ~2.6× the OpenCL kernel.
+
+- **`jackpot_coopmat` (`--coopmat`)** — the algorithm real miners use. The noise
+  depends only on the row (for A) or column (for B), so `PA = A+noise_a` (m×k)
+  and `PB = B+noise_b` (n×k) are **global per job**. Build them once, then the
+  per-r-slice product `G = PA·PBᵀ` is a batched int8 GEMM run on tensor cores
+  (`VK_KHR_cooperative_matrix`, `s8×s8→s32` 16×16×16), with each candidate a
+  cheap gather + XOR-reduce + BLAKE3. One workgroup = one (64-row band)×(64-col
+  block) = 32 candidates; `G` never leaves LDS. Tuned to **WG=256 + wave32**:
+
+  | Path | cand/s (RX 7900 XT, pool shape) | vs OpenCL wtile |
+  |---|---|---|
+  | `jackpot_search_rdna3_wtile.cl` (OpenCL) | ~348 000 | 1× |
+  | `jackpot_vk` (Vulkan, `--vulkan`) | ~0.9 M | ~2.6× |
+  | **`jackpot_coopmat` (`--coopmat`)** | **~37–38 M** | **~110×** |
+
+  Specialized to the live pool pattern (`rows=[0,32]` h=2, `cols=[0..63]` w=64);
+  other patterns fall back to Vulkan/OpenCL automatically. By the protocol's
+  display metric (`attempts × 2³² / s / 1e12`), 37 M cand/s ≈ **37 TH/s**.
+
+The whole chain is validated bit-identical to `evaluate_candidate` at the pool
+shape, and end-to-end against the live pool (accepted shares). Build:
+
+```bash
+bash src/pearl_amd/vk/build.sh    # needs LunarG Vulkan SDK (glslc) + MinGW g++
+```
+
+Research harness, oracle, and per-phase validators live in
+`experiments/vk_coopmat/` (`amortized_oracle.py`, `live_share_probe.py`,
+`live_mine_continuous.py`, `ARCHITECTURE.md`).
 
 ## Acknowledgements
 
