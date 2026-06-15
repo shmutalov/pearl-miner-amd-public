@@ -255,6 +255,15 @@ Research harness, oracle, and per-phase validators live in
 - The Decred developers for the consensus / SPV building blocks Pearl
   builds on.
 
+## Donations
+
+If this project was useful to you, PRL donations are welcome (wallet created at
+[compute.pearlresearch.ai/wallet](https://compute.pearlresearch.ai/wallet)):
+
+```
+prl1p5vtjsxajasd805qtc2xp5zp3tl99egklxzfr0th7m0v8ue858uvs7hrhhs
+```
+
 ## License
 
 [ISC](LICENSE), matching the upstream Pearl reference repository.
