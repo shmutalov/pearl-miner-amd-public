@@ -191,6 +191,44 @@ class JackpotCoopmat:
         best_lz = 256 - best_val.bit_length() if best_val > 0 else 256
         return cand, attempts, time.time() - t0, best_lz
 
+    def search_all(self, mining_config, target: int, *, max_return: int = 256,
+                   chunk_wg: int = 300_000):
+        """Return up to ``max_return`` DISTINCT candidates below ``target`` from a
+        single job (each (t_r,t_c) is a distinct valid share). Stops once enough
+        are collected. Returns ``(list[Candidate], attempts, seconds)``."""
+        import time
+        from .candidate_search import Candidate
+        rp, cp = mining_config.rows_pattern, mining_config.cols_pattern
+        self._check_pattern(rp, cp)
+        nbands, nblocks = self._m // 64, self._n // 64
+        total_wg = nbands * nblocks
+        tgt = np.frombuffer(int(target).to_bytes(32, "little"), dtype=np.uint8).copy()
+        cnt = c_int(0)
+        out: list = []
+        attempts = 0
+        t0 = time.time()
+        wg_off = 0
+        while wg_off < total_wg and len(out) < max_return:
+            this = min(chunk_wg, total_wg - wg_off)
+            rc = self.lib.jcm_search_tile(self.ctx, _ptr(tgt, c_uint8), wg_off, this,
+                                          _ptr(self._records, c_uint32), byref(cnt))
+            if rc != 0:
+                raise RuntimeError(f"jcm_search_tile failed ({rc})")
+            attempts += this * 32
+            saved = min(cnt.value, self.max_hits)
+            for i in range(saved):
+                if len(out) >= max_return:
+                    break
+                rec = self._records[i]
+                t_r, t_c = int(rec[0]), int(rec[1])
+                hb = rec[2:10].astype("<u4").tobytes()
+                out.append(Candidate(t_rows=t_r, t_cols=t_c,
+                    a_rows_indices=list(rp.indices_with_offset(t_r)),
+                    b_cols_indices=list(cp.indices_with_offset(t_c)),
+                    hash_jackpot=hb, target_value=int.from_bytes(hb, "little")))
+            wg_off += this
+        return out, attempts, time.time() - t0
+
     def last_gpu_ms(self) -> float:
         return float(self.lib.jcm_last_gpu_ms(self.ctx))
 
