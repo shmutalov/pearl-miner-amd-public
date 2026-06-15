@@ -196,7 +196,15 @@ class StratumSession:
                 self._on_log(f"  [session] failed to derive mining_config/job_key: {e!r}")
                 return
             try:
-                target = nbits_hex_to_target(self._latest_notify["share_nbits"])
+                # Pearl credits each attempt as H_PER_ATTEMPT = 2^32 hash-equivalents
+                # (the miner's TH/s = attempts * 2^32 / time / 1e12). So a share is
+                # ACCEPTED when its scaled difficulty 2^256/hash >= share_difficulty,
+                # i.e. hash <= 2^256/D = (raw nbits target = 2^224/D) << 32. Searching
+                # at the raw nbits target (32 bits too strict) finds ~nothing; the
+                # scaled target makes expected candidates/share = D. Verified live:
+                # a target_lz~29 hash is accepted at D=50000 (raw nbits target_lz~47).
+                _raw = nbits_hex_to_target(self._latest_notify["share_nbits"])
+                target = min(_raw << 32, (1 << 256) - 1)
             except Exception as e:
                 self._on_log(f"  [session] failed to decode share_nbits: {e!r}")
                 return

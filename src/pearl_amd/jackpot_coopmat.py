@@ -144,6 +144,53 @@ class JackpotCoopmat:
             wg_off += this
         return None, attempts, time.time() - t0
 
+    def search_best(self, mining_config, *, loose_target_lz: int = 24,
+                    max_attempts: int | None = None, chunk_wg: int = 300_000):
+        """Scan the grid at a loose target and return the single BEST (lowest
+        LE-uint256) candidate found, as ``(Candidate_or_None, attempts, seconds,
+        best_lz)``. Used to probe how good a hash we can actually produce vs the
+        pool's required threshold."""
+        import time
+        from .candidate_search import Candidate
+        rp, cp = mining_config.rows_pattern, mining_config.cols_pattern
+        self._check_pattern(rp, cp)
+        nbands, nblocks = self._m // 64, self._n // 64
+        total_wg = nbands * nblocks
+        wg_cap = total_wg if not max_attempts else min(total_wg, (int(max_attempts) + 31) // 32)
+        loose_target = 1 << (256 - loose_target_lz)
+        tgt = np.frombuffer(loose_target.to_bytes(32, "little"), dtype=np.uint8).copy()
+        cnt = c_int(0)
+        best_val = None
+        best_rec = None
+        attempts = 0
+        t0 = time.time()
+        wg_off = 0
+        while wg_off < wg_cap:
+            this = min(chunk_wg, wg_cap - wg_off)
+            rc = self.lib.jcm_search_tile(self.ctx, _ptr(tgt, c_uint8), wg_off, this,
+                                          _ptr(self._records, c_uint32), byref(cnt))
+            if rc != 0:
+                raise RuntimeError(f"jcm_search_tile failed ({rc})")
+            attempts += this * 32
+            saved = min(cnt.value, self.max_hits)
+            for i in range(saved):
+                rec = self._records[i]
+                v = int.from_bytes(rec[2:10].astype("<u4").tobytes(), "little")
+                if best_val is None or v < best_val:
+                    best_val = v
+                    best_rec = rec.copy()
+            wg_off += this
+        if best_rec is None:
+            return None, attempts, time.time() - t0, 0
+        t_r, t_c = int(best_rec[0]), int(best_rec[1])
+        hb = best_rec[2:10].astype("<u4").tobytes()
+        cand = Candidate(t_rows=t_r, t_cols=t_c,
+            a_rows_indices=list(rp.indices_with_offset(t_r)),
+            b_cols_indices=list(cp.indices_with_offset(t_c)),
+            hash_jackpot=hb, target_value=best_val)
+        best_lz = 256 - best_val.bit_length() if best_val > 0 else 256
+        return cand, attempts, time.time() - t0, best_lz
+
     def last_gpu_ms(self) -> float:
         return float(self.lib.jcm_last_gpu_ms(self.ctx))
 
