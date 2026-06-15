@@ -44,13 +44,24 @@ def main() -> int:
     commitment_hash = jm.commitment_hash()
     _, a_noise_seed = commitment_hash
 
-    PA_i8, PB_i8, *_ = build_global_PA_PB(A, B, k, r, commitment_hash)
+    PA_i8, PB_i8, e_ar_t, e_bl, e_al_full, e_br_full = build_global_PA_PB(
+        A, B, k, r, commitment_hash)
 
     # Row-major C-contiguous int8.
     np.ascontiguousarray(PA_i8).tofile(os.path.join(out, "PA.bin"))
     np.ascontiguousarray(PB_i8).tofile(os.path.join(out, "PB.bin"))
     # BLAKE3 keyed-hash key = a_noise_seed as 8 LE u32.
     np.frombuffer(a_noise_seed, dtype="<u4").tofile(os.path.join(out, "key.bin"))
+
+    if "--raw" in sys.argv:
+        # Raw inputs for the GPU PA/PB-build kernel (Phase A) validation.
+        np.ascontiguousarray(A).tofile(os.path.join(out, "A.bin"))                 # m x k i8
+        np.ascontiguousarray(B).tofile(os.path.join(out, "B.bin"))                 # n x k i8
+        np.ascontiguousarray(e_al_full).tofile(os.path.join(out, "EAL.bin"))       # m x r i8
+        np.ascontiguousarray(e_br_full).tofile(os.path.join(out, "EBR.bin"))       # n x r i8
+        np.ascontiguousarray(e_ar_t.astype("<u4")).tofile(os.path.join(out, "EAR.bin"))  # k x 2 u32
+        np.ascontiguousarray(e_bl.astype("<u4")).tofile(os.path.join(out, "EBL.bin"))    # k x 2 u32
+        print("  + raw inputs A,B,EAL,EBR,EAR,EBL")
 
     meta = dict(m=m, n=n, k=k, r=r, nbands=m // 64, nblocks=n // 64)
     with open(os.path.join(out, "meta.json"), "w") as f:
