@@ -141,6 +141,7 @@ class PearlMiner:
                  use_gpu_merkle: bool = True,
                  use_gpu_derive: bool = True,
                  use_gpu_jackpot: bool = True,
+                 use_vulkan_jackpot: bool = False,
                  jackpot_batch_size: int = 8192) -> None:
         if len(miner_seed) != 32:
             raise ValueError("miner_seed must be 32 bytes")
@@ -158,7 +159,14 @@ class PearlMiner:
         self._derive_gpu: DeriveMatrixGpu | None = None
         self._jackpot_gpu: JackpotGpu | None = None
         self._jackpot_shape: tuple[int, int, int] | None = None
-        self._use_gpu_jackpot = use_gpu_jackpot and _GPU_JACKPOT_AVAILABLE
+        # Vulkan jackpot (experiments/vk_jackpot): ~2.6x the OpenCL kernel.
+        # When enabled it takes over set_job + search; A/B are uploaded host->
+        # Vulkan once per job (noise derived via the shared OpenCL context).
+        self._use_vulkan_jackpot = use_vulkan_jackpot
+        self._jackpot_vk = None
+        self._jackpot_vk_shape: tuple[int, int, int] | None = None
+        self._use_gpu_jackpot = (use_gpu_jackpot and _GPU_JACKPOT_AVAILABLE
+                                 and not use_vulkan_jackpot)
         # Share one OpenCL context across the GPU helpers so device buffers
         # produced by derive can be consumed by merkle / jackpot without
         # round-tripping 512 MiB matrices through host memory.
@@ -190,6 +198,26 @@ class PearlMiner:
             self._jackpot_gpu = JackpotGpu(h, w, r)
         self._jackpot_shape = (h, w, r)
         return self._jackpot_gpu
+
+    def _ensure_jackpot_vk(self, h: int, w: int, r: int):
+        """Lazily build the Vulkan jackpot evaluator (loads the DLL from
+        experiments/vk_jackpot). Noise is derived on the shared OpenCL context;
+        A/B are uploaded host->Vulkan in set_job."""
+        if not self._use_vulkan_jackpot:
+            return None
+        if self._jackpot_vk is not None and self._jackpot_vk_shape == (h, w, r):
+            return self._jackpot_vk
+        import sys as _sys
+        from pathlib import Path as _Path
+        vkdir = str(_Path(__file__).resolve().parents[2] / "experiments" / "vk_jackpot")
+        if vkdir not in _sys.path:
+            _sys.path.insert(0, vkdir)
+        from jackpot_vk import JackpotVk  # type: ignore
+        nc = self._derive_gpu.context if self._derive_gpu is not None else None
+        nq = self._derive_gpu.queue if self._derive_gpu is not None else None
+        self._jackpot_vk = JackpotVk(h, w, r, noise_context=nc, noise_queue=nq)
+        self._jackpot_vk_shape = (h, w, r)
+        return self._jackpot_vk
 
     def _emit(self, kind: str, **info: object) -> None:
         self._on_event(kind, info)
@@ -273,6 +301,15 @@ class PearlMiner:
             self._emit("jackpot_set_job_done", seconds=time.time() - t0,
                        h=h, w=w, r=r)
 
+        jvk = self._ensure_jackpot_vk(h, w, r)
+        if jvk is not None:
+            t0 = time.time()
+            jvk.set_job(self._A, self._B,
+                        mc.rows_pattern.to_list(), mc.cols_pattern.to_list(),
+                        jm.commitment_hash(), jm.commitment_hash()[1])
+            self._emit("jackpot_vk_set_job_done", seconds=time.time() - t0,
+                       h=h, w=w, r=r)
+
         return MinerState(
             miner_seed=self.miner_seed,
             A=self._A, B=self._B,
@@ -293,7 +330,14 @@ class PearlMiner:
                                        if last_target > 0 else 256))
 
         t0 = time.time()
-        if self._jackpot_gpu is not None:
+        if self._jackpot_vk is not None:
+            # Native search loop runs to a hit / max_attempts in one call (no
+            # mid-run progress_cb); the miner bounds it via max_attempts_per_job.
+            hit, attempts, dt = self._jackpot_vk.search(
+                work.mining_config, work.target,
+                batch_size=self.jackpot_batch_size,
+                max_attempts=self.max_attempts_per_job)
+        elif self._jackpot_gpu is not None:
             hit, attempts, dt = self._jackpot_gpu.search(
                 work.mining_config, work.target,
                 batch_size=self.jackpot_batch_size,

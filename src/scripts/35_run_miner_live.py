@@ -56,6 +56,8 @@ def main() -> int:
     ap.add_argument("--observe-seconds", type=float, default=60.0)
     ap.add_argument("--max-attempts-per-job", type=int, default=200_000)
     ap.add_argument("--jackpot-batch-size", type=int, default=8192)
+    ap.add_argument("--vulkan", action="store_true",
+                    help="use the Vulkan jackpot evaluator (~2.6x; experiments/vk_jackpot)")
     ap.add_argument("--seed-hex", default=None,
                     help="32-byte miner seed; default = random")
     ap.add_argument("--submit", action="store_true",
@@ -141,10 +143,12 @@ def main() -> int:
             max_attempts_per_job=args.max_attempts_per_job,
             on_event=_on_event,
             jackpot_batch_size=args.jackpot_batch_size,
+            use_vulkan_jackpot=args.vulkan,
         )
         print(f"[{_ts()}] PearlMiner ready: derive_gpu={miner._derive_gpu is not None}, "
               f"merkle_gpu={miner._merkle_gpu is not None}, "
-              f"jackpot_gpu={miner._use_gpu_jackpot}")
+              f"jackpot_gpu={miner._use_gpu_jackpot}, "
+              f"jackpot_vulkan={miner._use_vulkan_jackpot}")
 
         # Patch submit_share for dry-run mode: log the proof bytes' length
         # and the first hash bytes; don't actually send to the pool.
