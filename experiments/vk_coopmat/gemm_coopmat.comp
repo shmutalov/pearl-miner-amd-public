@@ -1,0 +1,48 @@
+#version 460
+// Standalone int8 GEMM via VK_KHR_cooperative_matrix, to prove the GLSL coopmat
+// path compiles + runs correctly on this glslc/LLPC before wiring Pearl in.
+// Computes C(MxN, int32) = A(MxK, s8) * B(NxK, s8)^T, one workgroup = one subgroup.
+#extension GL_KHR_cooperative_matrix          : require
+#extension GL_KHR_memory_scope_semantics      : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8  : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic       : require
+
+#ifndef M
+#define M 64
+#endif
+#ifndef N
+#define N 64
+#endif
+#ifndef K
+#define K 128
+#endif
+
+layout(local_size_x = 64) in;   // one wave64 subgroup
+
+layout(std430, binding = 0) readonly  buffer A_b { int8_t  a[]; };
+layout(std430, binding = 1) readonly  buffer B_b { int8_t  b[]; };
+layout(std430, binding = 2) writeonly buffer C_b { int32_t c[]; };
+
+void main() {
+    for (uint mt = 0; mt < M / 16u; ++mt) {
+        for (uint nt = 0; nt < N / 16u; ++nt) {
+            coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+                coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+            for (uint kt = 0; kt < K / 16u; ++kt) {
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+                // A tile (rows mt*16, cols kt*16), row-major, stride K.
+                coopMatLoad(ma, a, (mt * 16u) * K + kt * 16u, uint(K),
+                            gl_CooperativeMatrixLayoutRowMajor);
+                // B^T tile (rows kt*16, cols nt*16): load from B (N x K row-major)
+                // base (nt*16)*K + kt*16, column-major stride K -> transpose.
+                coopMatLoad(mb, b, (nt * 16u) * K + kt * 16u, uint(K),
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                acc = coopMatMulAdd(ma, mb, acc);
+            }
+            coopMatStore(acc, c, (mt * 16u) * N + nt * 16u, uint(N),
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}
