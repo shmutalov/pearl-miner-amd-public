@@ -1,0 +1,36 @@
+#version 460
+// Phase A: build a global noised matrix P (rows x k int8) from source S, the
+// per-row uniform noise table EUL (rows x r int8), and the global permutation
+// table PERM (k x 2 u32):
+//   P[row][l] = wrap8( S[row][l] + EUL[row][perm[l].x] - EUL[row][perm[l].y] )
+// Used twice: (A, e_al, e_ar_t) -> PA  and  (B, e_br_t, e_bl) -> PB.
+// One workgroup per row; the row's r noise values are cached in LDS.
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+#ifndef PEARL_R
+#define PEARL_R 128
+#endif
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer S_b    { int8_t s[]; };    // rows x k
+layout(std430, binding = 1) readonly  buffer EUL_b  { int8_t eul[]; };  // rows x r
+layout(std430, binding = 2) readonly  buffer PERM_b { uvec2  perm[]; }; // k x 2
+layout(std430, binding = 3) writeonly buffer P_b    { int8_t p[]; };    // rows x k
+layout(push_constant) uniform PC { int k; } pc;
+
+shared int eul_row[PEARL_R];
+
+void main() {
+    int row = int(gl_WorkGroupID.x);
+    int tid = int(gl_LocalInvocationID.x);
+    int K = pc.k;
+    for (int i = tid; i < PEARL_R; i += 256) eul_row[i] = int(eul[row * PEARL_R + i]);
+    barrier();
+    for (int l = tid; l < K; l += 256) {
+        uvec2 pr = perm[l];
+        int na = eul_row[int(pr.x)] - eul_row[int(pr.y)];
+        int sv = int(s[row * K + l]);
+        p[row * K + l] = int8_t(sv + na);   // int8_t() wraps mod 256 (== kernel's &0xFF)
+    }
+}

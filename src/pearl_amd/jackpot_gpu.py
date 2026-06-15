@@ -26,7 +26,7 @@ import pyopencl as cl
 
 from .device import find_gpu
 from .jackpot import (
-    NOISE_RANGE, generate_permutation_matrix, generate_uniform_random_matrix,
+    generate_permutation_matrix, generate_uniform_random_matrix,
     SEED_LABEL_A, SEED_LABEL_B,
 )
 
@@ -203,9 +203,9 @@ class JackpotGpu:
             self._ebl_buf = cl.Buffer(ctx, mf.READ_WRITE, size=k * 2 * 4)
             self._noise_gpu.uniform(SEED_LABEL_A, a_noise_seed, m, self.r,
                                     out_buf=self._eal_buf, read_back=False)
-            self._noise_gpu.perm(SEED_LABEL_A, a_noise_seed, k, NOISE_RANGE // 2,
+            self._noise_gpu.perm(SEED_LABEL_A, a_noise_seed, k, self.r,
                                  out_buf=self._ear_buf, read_back=False)
-            self._noise_gpu.perm(SEED_LABEL_B, b_noise_seed, k, NOISE_RANGE // 2,
+            self._noise_gpu.perm(SEED_LABEL_B, b_noise_seed, k, self.r,
                                  out_buf=self._ebl_buf, read_back=False)
             self._noise_gpu.uniform(SEED_LABEL_B, b_noise_seed, n, self.r,
                                     out_buf=self._ebr_buf, read_back=False)
@@ -216,9 +216,9 @@ class JackpotGpu:
             e_al = generate_uniform_random_matrix(SEED_LABEL_A, a_noise_seed,
                                                   all_a_rows, self.r)
             e_ar_t = generate_permutation_matrix(SEED_LABEL_A, a_noise_seed,
-                                                 k, NOISE_RANGE // 2)
+                                                 k, self.r)
             e_bl = generate_permutation_matrix(SEED_LABEL_B, b_noise_seed,
-                                               k, NOISE_RANGE // 2)
+                                               k, self.r)
             e_br_t = generate_uniform_random_matrix(SEED_LABEL_B, b_noise_seed,
                                                     all_b_cols, self.r)
             self._eal_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=e_al)

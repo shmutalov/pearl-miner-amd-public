@@ -1,0 +1,10 @@
+# build + run artifacts
+*.exe
+*.spv
+*.o
+volk.h
+volk.c
+# job dumps (PA/PB up to ~1GB each at pool shape)
+job/
+jobP/
+*.bin

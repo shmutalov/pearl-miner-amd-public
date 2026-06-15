@@ -68,6 +68,13 @@ except Exception:  # pragma: no cover — wrapper import only; DLL checked at bu
     JackpotVk = None  # type: ignore[assignment]
     _GPU_VK_AVAILABLE = False
 
+try:
+    from .jackpot_coopmat import JackpotCoopmat  # amortized-GEMM + tensor cores
+    _GPU_COOPMAT_AVAILABLE = True
+except Exception:  # pragma: no cover — wrapper import only; DLL checked at build time
+    JackpotCoopmat = None  # type: ignore[assignment]
+    _GPU_COOPMAT_AVAILABLE = False
+
 
 log = logging.getLogger("pearl_amd.miner")
 
@@ -149,6 +156,7 @@ class PearlMiner:
                  use_gpu_derive: bool = True,
                  use_gpu_jackpot: bool = True,
                  use_vulkan_jackpot: bool = False,
+                 use_coopmat_jackpot: bool = False,
                  jackpot_batch_size: int = 8192) -> None:
         if len(miner_seed) != 32:
             raise ValueError("miner_seed must be 32 bytes")
@@ -172,6 +180,13 @@ class PearlMiner:
         self._use_vulkan_jackpot = use_vulkan_jackpot and _GPU_VK_AVAILABLE
         self._jackpot_vk = None
         self._jackpot_vk_shape: tuple[int, int, int] | None = None
+        # Coopmat jackpot (amortized GEMM on RDNA3 tensor cores, ~44x the
+        # per-candidate Vulkan kernel). Specialized to the live pool pattern
+        # (h=2, w=64); falls back to Vulkan/OpenCL if the pattern differs or the
+        # DLL/shaders aren't built. Takes priority over Vulkan when enabled.
+        self._use_coopmat_jackpot = use_coopmat_jackpot and _GPU_COOPMAT_AVAILABLE
+        self._jackpot_coopmat = None
+        self._jackpot_coopmat_shape: tuple[int, int, int, int] | None = None
         # OpenCL jackpot stays available as a fallback if Vulkan fails to build.
         self._use_gpu_jackpot = use_gpu_jackpot and _GPU_JACKPOT_AVAILABLE
         # Share one OpenCL context across the GPU helpers so device buffers
@@ -224,6 +239,25 @@ class PearlMiner:
             self._use_vulkan_jackpot = False
             self._jackpot_vk = None
         return self._jackpot_vk
+
+    def _ensure_jackpot_coopmat(self, h: int, w: int, r: int, k: int):
+        """Lazily build the coopmat evaluator (amortized GEMM + tensor cores).
+        Specialized to h=2,w=64; on any failure (unsupported pattern, DLL not
+        built, device init) disable it and fall back to Vulkan/OpenCL."""
+        if not self._use_coopmat_jackpot:
+            return None
+        if self._jackpot_coopmat is not None and self._jackpot_coopmat_shape == (h, w, r, k):
+            return self._jackpot_coopmat
+        nc = self._derive_gpu.context if self._derive_gpu is not None else None
+        nq = self._derive_gpu.queue if self._derive_gpu is not None else None
+        try:
+            self._jackpot_coopmat = JackpotCoopmat(h, w, r, k, noise_context=nc, noise_queue=nq)
+            self._jackpot_coopmat_shape = (h, w, r, k)
+        except Exception as e:
+            self._emit("jackpot_coopmat_unavailable", error=repr(e))
+            self._use_coopmat_jackpot = False
+            self._jackpot_coopmat = None
+        return self._jackpot_coopmat
 
     def _emit(self, kind: str, **info: object) -> None:
         self._on_event(kind, info)
@@ -297,10 +331,27 @@ class PearlMiner:
         h = len(mc.rows_pattern.to_list())
         w = len(mc.cols_pattern.to_list())
         r = mc.rank
-        # Prefer the Vulkan evaluator when enabled; else the OpenCL one (which
-        # can reuse the on-device A/B buffers from derive without re-uploading).
-        jvk = self._ensure_jackpot_vk(h, w, r)
-        if jvk is not None:
+        # Priority: coopmat (tensor cores) > Vulkan > OpenCL. The coopmat path
+        # is specialized to the pool pattern; on any failure it disables itself
+        # here and we fall through to Vulkan/OpenCL.
+        jcoop = self._ensure_jackpot_coopmat(h, w, r, k)
+        if jcoop is not None:
+            try:
+                t0 = time.time()
+                jcoop.set_job(self._A, self._B, mc.rows_pattern, mc.cols_pattern,
+                              jm.commitment_hash(), jm.commitment_hash()[1])
+                self._emit("jackpot_coopmat_set_job_done", seconds=time.time() - t0,
+                           h=h, w=w, r=r)
+            except Exception as e:
+                self._emit("jackpot_coopmat_unavailable", error=repr(e))
+                self._use_coopmat_jackpot = False
+                self._jackpot_coopmat = None
+                jcoop = None
+
+        jvk = None if jcoop is not None else self._ensure_jackpot_vk(h, w, r)
+        if jcoop is not None:
+            pass
+        elif jvk is not None:
             t0 = time.time()
             jvk.set_job(self._A, self._B,
                         mc.rows_pattern.to_list(), mc.cols_pattern.to_list(),
@@ -338,7 +389,13 @@ class PearlMiner:
                                        if last_target > 0 else 256))
 
         t0 = time.time()
-        if self._jackpot_vk is not None:
+        if self._jackpot_coopmat is not None:
+            # Tensor-core grid sweep in TDR-safe tiles; bounded by max_attempts.
+            hit, attempts, dt = self._jackpot_coopmat.search(
+                work.mining_config, work.target,
+                batch_size=self.jackpot_batch_size,
+                max_attempts=self.max_attempts_per_job)
+        elif self._jackpot_vk is not None:
             # Native search loop runs to a hit / max_attempts in one call (no
             # mid-run progress_cb); the miner bounds it via max_attempts_per_job.
             hit, attempts, dt = self._jackpot_vk.search(

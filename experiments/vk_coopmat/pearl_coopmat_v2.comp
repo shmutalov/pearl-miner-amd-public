@@ -1,0 +1,126 @@
+#version 460
+// v2: LDS-staged amortized Pearl kernel. Each 64xR strip of PA/PB is staged into
+// shared int8 once per slice, then coopMatLoad reads from LDS instead of global
+// (the v1 kernel re-read PA/PB 4x from global -> memory bound). Tests whether
+// coopMatLoad-from-shared-int8 compiles + is correct on this LLPC.
+#extension GL_KHR_cooperative_matrix          : require
+#extension GL_KHR_memory_scope_semantics      : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8  : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic       : require
+
+#ifndef PEARL_R
+#define PEARL_R 128
+#endif
+#ifndef WG
+#define WG 64
+#endif
+#define BAND  64
+#define BLOCK 64
+#define NCAND 32
+#define JACKPOT_SIZE 16
+#define LROT 13u
+
+layout(local_size_x = WG) in;
+
+layout(std430, binding = 0) readonly  buffer PA_b  { int8_t pa[]; };
+layout(std430, binding = 1) readonly  buffer PB_b  { int8_t pb[]; };
+layout(std430, binding = 2) readonly  buffer KEY_b { uint   key[]; };
+layout(std430, binding = 3) writeonly buffer OUT_b { uint   outh[]; };
+layout(push_constant) uniform PC { int nblocks; int k; int wg_off; } pc;
+
+shared int8_t  paS[BAND  * PEARL_R];     // 64*R staged strip
+shared int8_t  pbS[BLOCK * PEARL_R];
+shared int32_t Gs[BAND * BLOCK];
+shared uint    jmsg[NCAND * JACKPOT_SIZE];
+
+uint rotr32(uint x, uint n) { return (x >> n) | (x << (32u - n)); }
+void g(inout uint v[16], int a, int b, int c, int d, uint mx, uint my) {
+    v[a] = v[a] + v[b] + mx; v[d] = rotr32(v[d] ^ v[a], 16u);
+    v[c] = v[c] + v[d];      v[b] = rotr32(v[b] ^ v[c], 12u);
+    v[a] = v[a] + v[b] + my; v[d] = rotr32(v[d] ^ v[a],  8u);
+    v[c] = v[c] + v[d];      v[b] = rotr32(v[b] ^ v[c],  7u);
+}
+void blake3_compress(out uint outw[8], uint kk[8], uint m[16]) {
+    uint v[16];
+    v[0]=kk[0]; v[1]=kk[1]; v[2]=kk[2]; v[3]=kk[3];
+    v[4]=kk[4]; v[5]=kk[5]; v[6]=kk[6]; v[7]=kk[7];
+    v[8]=0x6A09E667u; v[9]=0xBB67AE85u; v[10]=0x3C6EF372u; v[11]=0xA54FF53Au;
+    v[12]=0u; v[13]=0u; v[14]=64u; v[15]=0x01u|0x02u|0x08u|0x10u;
+    #define RND(s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,sa,sb,sc,sd,se,sf) \
+        g(v,0,4,8, 12, m[s0],m[s1]); g(v,1,5,9, 13, m[s2],m[s3]); \
+        g(v,2,6,10,14, m[s4],m[s5]); g(v,3,7,11,15, m[s6],m[s7]); \
+        g(v,0,5,10,15, m[s8],m[s9]); g(v,1,6,11,12, m[sa],m[sb]); \
+        g(v,2,7,8, 13, m[sc],m[sd]); g(v,3,4,9, 14, m[se],m[sf]);
+    RND(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
+    RND(2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8)
+    RND(3,4,10,12,13,2,7,14,6,5,9,0,11,15,8,1)
+    RND(10,7,12,9,14,3,13,15,4,0,11,2,5,8,1,6)
+    RND(12,13,9,11,15,10,14,8,7,2,5,3,0,1,6,4)
+    RND(9,14,11,5,8,12,15,1,13,3,0,10,2,6,4,7)
+    RND(11,15,5,0,1,9,8,6,14,10,2,12,3,4,7,13)
+    #undef RND
+    outw[0]=v[0]^v[8];  outw[1]=v[1]^v[9];  outw[2]=v[2]^v[10]; outw[3]=v[3]^v[11];
+    outw[4]=v[4]^v[12]; outw[5]=v[5]^v[13]; outw[6]=v[6]^v[14]; outw[7]=v[7]^v[15];
+}
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    int w   = pc.wg_off + int(gl_WorkGroupID.x);
+    int g0  = (w / pc.nblocks) * BAND;
+    int b0  = (w % pc.nblocks) * BLOCK;
+    int K   = pc.k;
+    int n_iters = K / PEARL_R;
+
+    for (int i = tid; i < NCAND * JACKPOT_SIZE; i += WG) jmsg[i] = 0u;
+    barrier();
+
+    for (int iter = 0; iter < n_iters; ++iter) {
+        int k0 = iter * PEARL_R;
+        // stage strips into LDS once (1x global read).
+        for (int idx = tid; idx < BAND * PEARL_R; idx += WG) {
+            int i = idx / PEARL_R, l = idx % PEARL_R;
+            paS[idx] = pa[(g0 + i) * K + k0 + l];
+        }
+        for (int idx = tid; idx < BLOCK * PEARL_R; idx += WG) {
+            int j = idx / PEARL_R, l = idx % PEARL_R;
+            pbS[idx] = pb[(b0 + j) * K + k0 + l];
+        }
+        barrier();
+        for (uint mt = 0; mt < BAND / 16u; ++mt) {
+            for (uint nt = 0; nt < BLOCK / 16u; ++nt) {
+                coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+                    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+                for (uint kt = 0; kt < uint(PEARL_R) / 16u; ++kt) {
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+                    coopMatLoad(ma, paS, (mt * 16u) * uint(PEARL_R) + kt * 16u, uint(PEARL_R),
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(mb, pbS, (nt * 16u) * uint(PEARL_R) + kt * 16u, uint(PEARL_R),
+                                gl_CooperativeMatrixLayoutColumnMajor);
+                    acc = coopMatMulAdd(ma, mb, acc);
+                }
+                coopMatStore(acc, Gs, (mt * 16u) * BLOCK + nt * 16u, uint(BLOCK),
+                             gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        barrier();
+        if (tid < NCAND) {
+            uint x = 0u;
+            int r0 = tid * BLOCK, r1 = (tid + 32) * BLOCK;
+            for (int j = 0; j < BLOCK; ++j) x ^= uint(Gs[r0 + j]) ^ uint(Gs[r1 + j]);
+            int slot = iter % JACKPOT_SIZE;
+            uint cur = jmsg[tid * JACKPOT_SIZE + slot];
+            jmsg[tid * JACKPOT_SIZE + slot] = ((cur << LROT) | (cur >> (32u - LROT))) ^ x;
+        }
+        barrier();
+    }
+
+    if (tid < NCAND) {
+        uint kk[8]; for (int i = 0; i < 8; ++i) kk[i] = key[i];
+        uint m[16];  for (int i = 0; i < 16; ++i) m[i] = jmsg[tid * JACKPOT_SIZE + i];
+        uint h[8]; blake3_compress(h, kk, m);
+        int outBase = (int(gl_WorkGroupID.x) * NCAND + tid) * 8;
+        for (int i = 0; i < 8; ++i) outh[outBase + i] = h[i];
+    }
+}
