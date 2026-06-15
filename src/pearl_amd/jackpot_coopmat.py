@@ -25,6 +25,9 @@ _DLL = _VK / "jackpot_coopmat_vk.dll"
 _POOL_ROWS = [0, 32]
 _POOL_COLS = list(range(64))
 
+# Number of ping-pong search slots in the DLL (jackpot_coopmat_vk.cpp NSLOT).
+_NSLOT = 2
+
 
 def _ptr(arr, ctype):
     return arr.ctypes.data_as(POINTER(ctype))
@@ -52,8 +55,15 @@ class JackpotCoopmat:
         self.lib.jcm_search_tile.restype = c_int
         self.lib.jcm_search_tile.argtypes = [c_void_p, POINTER(c_uint8), c_int64, c_int,
                                              POINTER(c_uint32), POINTER(c_int)]
+        # Async ping-pong split: submit a tile on a slot (no wait), collect later.
+        self.lib.jcm_search_submit.restype = c_int
+        self.lib.jcm_search_submit.argtypes = [c_void_p, c_int, POINTER(c_uint8),
+                                               c_int64, c_int]
+        self.lib.jcm_search_collect.restype = c_int
+        self.lib.jcm_search_collect.argtypes = [c_void_p, c_int, POINTER(c_uint32),
+                                                POINTER(c_int)]
         self.lib.jcm_last_gpu_ms.restype = c_double
-        self.lib.jcm_last_gpu_ms.argtypes = [c_void_p]
+        self.lib.jcm_last_gpu_ms.argtypes = [c_void_p, c_int]
         self.lib.jcm_destroy.argtypes = [c_void_p]
         self.max_hits = max_hits
         self.ctx = self.lib.jcm_create(str(pmat).encode(), str(search).encode(),
@@ -63,6 +73,10 @@ class JackpotCoopmat:
         self._m = self._n = 0
         self._noise_ctx = (noise_context, noise_queue, noise_device)
         self._records = np.empty((max_hits, 10), dtype=np.uint32)
+        # Per-slot readback buffers for the async ping-pong path; one in-flight
+        # collect per slot so the producer never aliases a buffer being read.
+        self._rec = [np.empty((max_hits, 10), dtype=np.uint32) for _ in range(_NSLOT)]
+        self.last_attempts = 0
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -229,8 +243,88 @@ class JackpotCoopmat:
             wg_off += this
         return out, attempts, time.time() - t0
 
-    def last_gpu_ms(self) -> float:
-        return float(self.lib.jcm_last_gpu_ms(self.ctx))
+    def search_all_stream(self, mining_config, target: int, *, max_return: int = 256,
+                          chunk_wg: int = 300_000):
+        """Streaming variant of :meth:`search_all`: yield distinct ``Candidate``
+        shares one tile at a time while the *next* tile is already running on the
+        GPU (the ``_NSLOT`` ping-pong slots in the DLL). The caller can build
+        proofs and submit shares for a yielded batch while the GPU keeps
+        searching, so host work (proof + network) overlaps GPU search instead of
+        serializing after it. Stops once ``max_return`` shares are yielded or the
+        whole (band x block) grid is swept. After exhaustion, ``self.last_attempts``
+        holds the candidate count scanned.
+
+        Slot discipline: tiles are submitted in order across alternating slots
+        and collected in submission order via a FIFO; each slot is always
+        collected before it is resubmitted (the DLL also fences this), so the two
+        readback buffers never alias an in-flight tile.
+        """
+        from collections import deque
+        from .candidate_search import Candidate
+        rp, cp = mining_config.rows_pattern, mining_config.cols_pattern
+        self._check_pattern(rp, cp)
+        nbands, nblocks = self._m // 64, self._n // 64
+        total_wg = nbands * nblocks
+        tgt = np.frombuffer(int(target).to_bytes(32, "little"), dtype=np.uint8).copy()
+        offsets = list(range(0, total_wg, chunk_wg))
+        cnt = [c_int(0) for _ in range(_NSLOT)]
+        self.last_attempts = 0
+        if not offsets:
+            return
+
+        def _submit(slot: int, idx: int) -> int:
+            wg_off = offsets[idx]
+            this = min(chunk_wg, total_wg - wg_off)
+            rc = self.lib.jcm_search_submit(self.ctx, slot, _ptr(tgt, c_uint8),
+                                            wg_off, this)
+            if rc != 0:
+                raise RuntimeError(f"jcm_search_submit failed ({rc})")
+            return this
+
+        def _collect(slot: int) -> int:
+            rc = self.lib.jcm_search_collect(self.ctx, slot,
+                                             _ptr(self._rec[slot], c_uint32),
+                                             byref(cnt[slot]))
+            if rc != 0:
+                raise RuntimeError(f"jcm_search_collect failed ({rc})")
+            return cnt[slot].value
+
+        n_tiles = len(offsets)
+        fifo: deque = deque()          # (slot, tile_idx, wg_cnt) in submission order
+        next_idx = 0
+        # Prime the slots.
+        while next_idx < n_tiles and len(fifo) < _NSLOT:
+            slot = next_idx % _NSLOT
+            fifo.append((slot, next_idx, _submit(slot, next_idx)))
+            next_idx += 1
+
+        attempts = 0
+        yielded = 0
+        while fifo:
+            slot, _idx, wgc = fifo.popleft()
+            saved = min(_collect(slot), self.max_hits)
+            attempts += wgc * 32
+            # Refill this slot with the next tile BEFORE we drain its hits, so the
+            # GPU starts the next dispatch while the caller processes this batch.
+            if next_idx < n_tiles and yielded < max_return:
+                fifo.append((slot, next_idx, _submit(slot, next_idx)))
+                next_idx += 1
+            rec = self._rec[slot]
+            for i in range(saved):
+                if yielded >= max_return:
+                    break
+                r = rec[i]
+                t_r, t_c = int(r[0]), int(r[1])
+                hb = r[2:10].astype("<u4").tobytes()
+                yield Candidate(t_rows=t_r, t_cols=t_c,
+                    a_rows_indices=list(rp.indices_with_offset(t_r)),
+                    b_cols_indices=list(cp.indices_with_offset(t_c)),
+                    hash_jackpot=hb, target_value=int.from_bytes(hb, "little"))
+                yielded += 1
+            self.last_attempts = attempts
+
+    def last_gpu_ms(self, slot: int = 0) -> float:
+        return float(self.lib.jcm_last_gpu_ms(self.ctx, slot))
 
     def close(self):
         if getattr(self, "ctx", None):

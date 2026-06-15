@@ -26,17 +26,29 @@ namespace {
 
 struct Buf { VkBuffer buf{}; VkDeviceMemory mem{}; void* map{}; VkDeviceSize size{}; };
 
+// Two ping-pong search slots: the host submits one slot's tile while it drains
+// the other's hits (proof build + pool submit), so the GPU never idles on the
+// host. PA/PB/KEY are read-only during search and stay single (shared by both
+// slots); only TGT/HIT/descriptor-set/cmdbuf/fence/timestamps are duplicated.
+static const int NSLOT = 2;
+
 struct Ctx {
     VkInstance inst{}; VkPhysicalDevice pd{}; VkDevice dev{}; VkQueue queue{}; uint32_t qfi{};
-    VkCommandPool cp{}; VkCommandBuffer cb{}; double tsPeriod{}; VkQueryPool qpool{};
+    VkCommandPool cp{}; VkCommandBuffer cb{}; double tsPeriod{};
     VkPipeline pmatPipe{}, searchPipe{};
     VkPipelineLayout pmatPl{}, searchPl{};
     VkDescriptorSetLayout pmatDsl{}, searchDsl{};
     VkShaderModule pmatSm{}, searchSm{};
     VkDescriptorPool dpool{};
-    VkDescriptorSet pmatDsA{}, pmatDsB{}, searchDs{};
+    VkDescriptorSet pmatDsA{}, pmatDsB{};
+    // Per-slot search resources (ping-pong).
+    VkCommandBuffer scb[NSLOT]{};
+    VkDescriptorSet searchDs[NSLOT]{};
+    VkFence fence[NSLOT]{};
+    VkQueryPool qpool[NSLOT]{};
+    Buf dTGT[NSLOT], dHIT[NSLOT];
     int k{}, r{}, m{}, n{}, nbands{}, nblocks{}, maxHits{};
-    Buf dA,dB,dEAL,dEBR,dEAR,dEBL,dPA,dPB,dKEY,dTGT,dHIT;
+    Buf dA,dB,dEAL,dEBR,dEAR,dEBL,dPA,dPB,dKEY;
     bool jobSet{false};
 };
 
@@ -118,7 +130,12 @@ __declspec(dllexport) Ctx* jcm_create(const char* pmat_spv, const char* search_s
     vkGetPhysicalDeviceQueueFamilyProperties(c->pd,&qn,qfs.data()); c->qfi=~0u;
     for(uint32_t i=0;i<qn;++i) if(qfs[i].queueFlags&VK_QUEUE_COMPUTE_BIT){c->qfi=i;break;}
 
-    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR}; cmf.cooperativeMatrix=VK_TRUE;
+    // The coopmat SPIR-V declares OpCapability VulkanMemoryModel / OpMemoryModel
+    // Logical Vulkan (from GL_KHR_memory_scope_semantics + cooperative_matrix), so
+    // the device must enable the vulkanMemoryModel feature (core since Vulkan 1.2;
+    // device-scope variant is NOT declared, so it is not needed).
+    VkPhysicalDeviceVulkanMemoryModelFeatures vmm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES}; vmm.vulkanMemoryModel=VK_TRUE;
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR}; cmf.cooperativeMatrix=VK_TRUE; cmf.pNext=&vmm;
     VkPhysicalDevice8BitStorageFeatures s8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES}; s8.storageBuffer8BitAccess=VK_TRUE; s8.pNext=&cmf;
     VkPhysicalDeviceShaderFloat16Int8Features fi8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES}; fi8.shaderInt8=VK_TRUE; fi8.pNext=&s8;
     VkPhysicalDeviceSubgroupSizeControlFeatures sscf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES}; sscf.subgroupSizeControl=VK_TRUE; sscf.computeFullSubgroups=VK_TRUE; sscf.pNext=&fi8;
@@ -129,9 +146,11 @@ __declspec(dllexport) Ctx* jcm_create(const char* pmat_spv, const char* search_s
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cpci.queueFamilyIndex=c->qfi; cpci.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     CHECKP(vkCreateCommandPool(c->dev,&cpci,nullptr,&c->cp));
     VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; cbai.commandPool=c->cp; cbai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount=1;
-    CHECKP(vkAllocateCommandBuffers(c->dev,&cbai,&c->cb));
+    CHECKP(vkAllocateCommandBuffers(c->dev,&cbai,&c->cb));       // setup (uploads + pmat)
+    cbai.commandBufferCount=NSLOT; CHECKP(vkAllocateCommandBuffers(c->dev,&cbai,c->scb)); // per-slot search
     VkQueryPoolCreateInfo qp{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; qp.queryType=VK_QUERY_TYPE_TIMESTAMP; qp.queryCount=2;
-    CHECKP(vkCreateQueryPool(c->dev,&qp,nullptr,&c->qpool));
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; fci.flags=VK_FENCE_CREATE_SIGNALED_BIT;
+    for(int s=0;s<NSLOT;++s){ CHECKP(vkCreateQueryPool(c->dev,&qp,nullptr,&c->qpool[s])); CHECKP(vkCreateFence(c->dev,&fci,nullptr,&c->fence[s])); }
 
     c->pmatDsl=mkDsl(c,4); c->searchDsl=mkDsl(c,5);
     if(!c->pmatDsl||!c->searchDsl) return nullptr;
@@ -144,15 +163,18 @@ __declspec(dllexport) Ctx* jcm_create(const char* pmat_spv, const char* search_s
     if(mkPipe(c,pmat_spv,c->pmatPl,0,c->pmatSm,c->pmatPipe)) return nullptr;
     if(mkPipe(c,search_spv,c->searchPl,(uint32_t)subgroup_size,c->searchSm,c->searchPipe)) return nullptr;
 
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,4+4+5};
-    VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dp.maxSets=3; dp.poolSizeCount=1; dp.pPoolSizes=&ps;
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,(uint32_t)(4+4+5*NSLOT)};
+    VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dp.maxSets=2+NSLOT; dp.poolSizeCount=1; dp.pPoolSizes=&ps;
     CHECKP(vkCreateDescriptorPool(c->dev,&dp,nullptr,&c->dpool));
     auto alloc=[&](VkDescriptorSetLayout l)->VkDescriptorSet{ VkDescriptorSetAllocateInfo a{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; a.descriptorPool=c->dpool; a.descriptorSetCount=1; a.pSetLayouts=&l; VkDescriptorSet s; vkAllocateDescriptorSets(c->dev,&a,&s); return s; };
-    c->pmatDsA=alloc(c->pmatDsl); c->pmatDsB=alloc(c->pmatDsl); c->searchDs=alloc(c->searchDsl);
+    c->pmatDsA=alloc(c->pmatDsl); c->pmatDsB=alloc(c->pmatDsl);
+    for(int s=0;s<NSLOT;++s) c->searchDs[s]=alloc(c->searchDsl);
 
     auto HV=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    if(makeBuf(c,32,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,HV,c->dTGT)) return nullptr;
-    if(makeBuf(c,(VkDeviceSize)(1+c->maxHits*10)*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,HV,c->dHIT)) return nullptr;
+    for(int s=0;s<NSLOT;++s){
+        if(makeBuf(c,32,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,HV,c->dTGT[s])) return nullptr;
+        if(makeBuf(c,(VkDeviceSize)(1+c->maxHits*10)*4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,HV,c->dHIT[s])) return nullptr;
+    }
     return c;
 }
 
@@ -160,6 +182,7 @@ __declspec(dllexport) Ctx* jcm_create(const char* pmat_spv, const char* search_s
 __declspec(dllexport) int jcm_set_job(Ctx* c,
     const int8_t* A, const int8_t* B, const int8_t* e_al, const int8_t* e_br_t,
     const uint32_t* e_ar_t, const uint32_t* e_bl, const uint32_t* key, int m, int n){
+    vkDeviceWaitIdle(c->dev);   // drain any in-flight searches before freeing PA/PB
     freeJob(c);
     c->m=m; c->n=n; c->nbands=m/64; c->nblocks=n/64;
     int k=c->k, r=c->r;
@@ -174,7 +197,8 @@ __declspec(dllexport) int jcm_set_job(Ctx* c,
     if(makeBuf(c,(VkDeviceSize)n*k,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,c->dPB)) return -1;
     writeSet(c,c->pmatDsA,{c->dA.buf,c->dEAL.buf,c->dEAR.buf,c->dPA.buf});
     writeSet(c,c->pmatDsB,{c->dB.buf,c->dEBR.buf,c->dEBL.buf,c->dPB.buf});
-    writeSet(c,c->searchDs,{c->dPA.buf,c->dPB.buf,c->dKEY.buf,c->dTGT.buf,c->dHIT.buf});
+    for(int s=0;s<NSLOT;++s)
+        writeSet(c,c->searchDs[s],{c->dPA.buf,c->dPB.buf,c->dKEY.buf,c->dTGT[s].buf,c->dHIT[s].buf});
 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     CHECK(vkResetCommandBuffer(c->cb,0)); CHECK(vkBeginCommandBuffer(c->cb,&bi));
@@ -193,43 +217,70 @@ __declspec(dllexport) int jcm_set_job(Ctx* c,
     return 0;
 }
 
-// Search WGs [wg_off, wg_off+wg_cnt). Resets hit counter, dispatches, returns
-// up to maxHits records of 10 u32 {t_r, t_c, hash[8]} in out_records; *out_count
-// = total hits found in the tile (may exceed maxHits).
-__declspec(dllexport) int jcm_search_tile(Ctx* c, const uint8_t* target_le,
-    int64_t wg_off, int wg_cnt, uint32_t* out_records, int* out_count){
+// Record + submit one slot's search over WGs [wg_off, wg_off+wg_cnt) with the
+// slot's own fence; returns immediately (no idle-wait). The caller MUST
+// jcm_search_collect(slot) before submitting the same slot again. Fences start
+// signaled so the leading wait is a no-op on first use of each slot.
+__declspec(dllexport) int jcm_search_submit(Ctx* c, int slot, const uint8_t* target_le,
+    int64_t wg_off, int wg_cnt){
     if(!c->jobSet) return -2;
-    std::memcpy(c->dTGT.map, target_le, 32);
-    ((uint32_t*)c->dHIT.map)[0]=0u;
+    if(slot<0||slot>=NSLOT) return -3;
+    CHECK(vkWaitForFences(c->dev,1,&c->fence[slot],VK_TRUE,UINT64_MAX));
+    CHECK(vkResetFences(c->dev,1,&c->fence[slot]));
+    std::memcpy(c->dTGT[slot].map, target_le, 32);
+    ((uint32_t*)c->dHIT[slot].map)[0]=0u;
     int32_t pcv[4]={c->nblocks, c->k, (int32_t)wg_off, c->maxHits};
+    VkCommandBuffer cb=c->scb[slot];
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    CHECK(vkResetCommandBuffer(c->cb,0)); CHECK(vkBeginCommandBuffer(c->cb,&bi));
-    vkCmdResetQueryPool(c->cb,c->qpool,0,2);
-    vkCmdBindPipeline(c->cb,VK_PIPELINE_BIND_POINT_COMPUTE,c->searchPipe);
-    vkCmdBindDescriptorSets(c->cb,VK_PIPELINE_BIND_POINT_COMPUTE,c->searchPl,0,1,&c->searchDs,0,nullptr);
-    vkCmdPushConstants(c->cb,c->searchPl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pcv),pcv);
-    vkCmdWriteTimestamp(c->cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,c->qpool,0);
-    vkCmdDispatch(c->cb,(uint32_t)wg_cnt,1,1);
-    vkCmdWriteTimestamp(c->cb,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,c->qpool,1);
-    CHECK(vkEndCommandBuffer(c->cb));
-    if(submitWait(c,c->cb)) return -1;
-    uint32_t* hit=(uint32_t*)c->dHIT.map; uint32_t cnt=hit[0];
+    CHECK(vkResetCommandBuffer(cb,0)); CHECK(vkBeginCommandBuffer(cb,&bi));
+    vkCmdResetQueryPool(cb,c->qpool[slot],0,2);
+    vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,c->searchPipe);
+    vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,c->searchPl,0,1,&c->searchDs[slot],0,nullptr);
+    vkCmdPushConstants(cb,c->searchPl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pcv),pcv);
+    vkCmdWriteTimestamp(cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,c->qpool[slot],0);
+    vkCmdDispatch(cb,(uint32_t)wg_cnt,1,1);
+    vkCmdWriteTimestamp(cb,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,c->qpool[slot],1);
+    CHECK(vkEndCommandBuffer(cb));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&cb;
+    CHECK(vkQueueSubmit(c->queue,1,&si,c->fence[slot]));
+    return 0;
+}
+
+// Wait for slot's submission, then read up to maxHits records of 10 u32
+// {t_r, t_c, hash[8]} into out_records; *out_count = total hits in the tile
+// (may exceed maxHits). Leaves the fence signaled for the next submit.
+__declspec(dllexport) int jcm_search_collect(Ctx* c, int slot,
+    uint32_t* out_records, int* out_count){
+    if(slot<0||slot>=NSLOT) return -3;
+    CHECK(vkWaitForFences(c->dev,1,&c->fence[slot],VK_TRUE,UINT64_MAX));
+    uint32_t* hit=(uint32_t*)c->dHIT[slot].map; uint32_t cnt=hit[0];
     *out_count=(int)cnt;
     uint32_t saved=cnt<(uint32_t)c->maxHits?cnt:(uint32_t)c->maxHits;
     if(saved) std::memcpy(out_records, hit+1, (size_t)saved*10*4);
     return 0;
 }
 
-__declspec(dllexport) double jcm_last_gpu_ms(Ctx* c){
-    uint64_t ts[2]; if(vkGetQueryPoolResults(c->dev,c->qpool,0,2,sizeof(ts),ts,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT)!=VK_SUCCESS) return -1;
+// Back-compat synchronous tile = submit(slot 0) + collect(slot 0).
+__declspec(dllexport) int jcm_search_tile(Ctx* c, const uint8_t* target_le,
+    int64_t wg_off, int wg_cnt, uint32_t* out_records, int* out_count){
+    int rc=jcm_search_submit(c,0,target_le,wg_off,wg_cnt); if(rc) return rc;
+    return jcm_search_collect(c,0,out_records,out_count);
+}
+
+__declspec(dllexport) double jcm_last_gpu_ms(Ctx* c, int slot){
+    if(slot<0||slot>=NSLOT) return -1;
+    uint64_t ts[2]; if(vkGetQueryPoolResults(c->dev,c->qpool[slot],0,2,sizeof(ts),ts,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT)!=VK_SUCCESS) return -1;
     return (ts[1]-ts[0])*c->tsPeriod/1e6;
 }
 
 __declspec(dllexport) void jcm_destroy(Ctx* c){
     if(!c) return;
     if(c->dev){ vkDeviceWaitIdle(c->dev); freeJob(c);
-        destroyBuf(c,c->dTGT); destroyBuf(c,c->dHIT);
-        if(c->qpool)vkDestroyQueryPool(c->dev,c->qpool,nullptr);
+        for(int s=0;s<NSLOT;++s){
+            destroyBuf(c,c->dTGT[s]); destroyBuf(c,c->dHIT[s]);
+            if(c->fence[s])vkDestroyFence(c->dev,c->fence[s],nullptr);
+            if(c->qpool[s])vkDestroyQueryPool(c->dev,c->qpool[s],nullptr);
+        }
         if(c->pmatPipe)vkDestroyPipeline(c->dev,c->pmatPipe,nullptr);
         if(c->searchPipe)vkDestroyPipeline(c->dev,c->searchPipe,nullptr);
         if(c->pmatSm)vkDestroyShaderModule(c->dev,c->pmatSm,nullptr);

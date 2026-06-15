@@ -28,6 +28,7 @@ search_candidate plugs into the same orchestrator without changing it.
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -391,17 +392,10 @@ class PearlMiner:
                                        if last_target > 0 else 256))
 
         # Coopmat: one job-space yields many distinct shares (≈ share_difficulty
-        # candidates per share). Find and submit a whole round of them.
+        # candidates per share). Stream them so host proof-build + pool submit
+        # overlap the GPU search of the next tile (producer/consumer split).
         if self._jackpot_coopmat is not None:
-            hits, attempts, dt = self._jackpot_coopmat.search_all(
-                work.mining_config, work.target,
-                max_return=self._coopmat_shares_per_round)
-            if not hits:
-                self._emit("search_exhausted", job_id=work.job_id,
-                           attempts=attempts, seconds=dt)
-                return
-            for hit in hits:
-                self._submit_hit(work, state, hit, attempts, dt)
+            self._search_coopmat_pipelined(work, state)
             return
 
         t0 = time.time()
@@ -429,6 +423,55 @@ class PearlMiner:
                        attempts=attempts, seconds=dt)
             return
         self._submit_hit(work, state, hit, attempts, dt)
+
+    def _search_coopmat_pipelined(self, work: Work, state: MinerState) -> None:
+        """One coopmat round with host/GPU overlap. The GPU search (this thread,
+        the producer) streams distinct shares tile-by-tile via
+        ``JackpotCoopmat.search_all_stream``; a single consumer thread builds the
+        PlainProof and submits each share to the pool. Because the producer
+        spends its time blocked in the GPU fence wait (GIL released) and submit
+        I/O also releases the GIL, proof-build + network for one tile overlap the
+        GPU search of the next, instead of serializing after the whole sweep.
+        One round = one (A,B) job-space; bounded by coopmat_shares_per_round."""
+        jcoop = self._jackpot_coopmat
+        t0 = time.time()
+        q: queue.Queue = queue.Queue(maxsize=64)
+        err: list[BaseException] = []
+        n_submitted = [0]
+
+        def _consumer() -> None:
+            while True:
+                item = q.get()
+                try:
+                    if item is None:
+                        return
+                    self._submit_hit(work, state, item,
+                                     jcoop.last_attempts, time.time() - t0)
+                    n_submitted[0] += 1
+                except BaseException as e:  # keep producer alive; surface later
+                    if not err:
+                        err.append(e)
+                finally:
+                    q.task_done()
+
+        worker = threading.Thread(target=_consumer, name="coopmat-submit", daemon=True)
+        worker.start()
+        try:
+            for cand in jcoop.search_all_stream(
+                    work.mining_config, work.target,
+                    max_return=self._coopmat_shares_per_round):
+                q.put(cand)
+                if err:                # consumer died (e.g. pool/socket error)
+                    break
+        finally:
+            q.put(None)                # sentinel: drain + stop the consumer
+            worker.join()
+
+        if err:
+            raise err[0]
+        if n_submitted[0] == 0:
+            self._emit("search_exhausted", job_id=work.job_id,
+                       attempts=jcoop.last_attempts, seconds=time.time() - t0)
 
     def _submit_hit(self, work: Work, state: MinerState, hit,
                     attempts: int, dt: float) -> None:
