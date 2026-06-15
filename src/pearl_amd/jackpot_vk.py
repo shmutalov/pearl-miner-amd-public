@@ -12,8 +12,9 @@ from ctypes import (c_void_p, c_int, c_double, POINTER, byref,
 from pathlib import Path
 import numpy as np
 
-_DIR = Path(__file__).resolve().parent
-_DLL = _DIR / "jackpot_vk.dll"
+# Native artifacts (built by src/pearl_amd/vk/build.sh) live in the vk/ subdir.
+_VK = Path(__file__).resolve().parent / "vk"
+_DLL = _VK / "jackpot_vk.dll"
 
 
 class JvkHit(C.Structure):
@@ -30,9 +31,9 @@ class JackpotVk:
                  reduce_mode: int = 0, subgroup_size: int = 0,
                  noise_context=None, noise_queue=None, noise_device=None):
         self.h, self.w, self.r = h, w, r
-        spv = _DIR / f"jackpot_r{r}_n{ntiles}_red{reduce_mode}.spv"
+        spv = _VK / f"jackpot_r{r}_n{ntiles}_red{reduce_mode}.spv"
         if not spv.exists():
-            raise FileNotFoundError(f"shader {spv} not built (run build.sh)")
+            raise FileNotFoundError(f"shader {spv} not built (run src/pearl_amd/vk/build.sh)")
         self.lib = C.CDLL(str(_DLL))
         self.lib.jvk_create.restype = c_void_p
         self.lib.jvk_create.argtypes = [c_int, c_int, c_int, C.c_char_p, c_int]
@@ -77,8 +78,8 @@ class JackpotVk:
 
     def set_job(self, A, B, row_pattern, col_pattern, commitment_hash, a_noise_seed):
         """JackpotGpu-compatible: derive noise on the GPU, then upload to Vulkan."""
-        from src.pearl_amd.pearl_noise_gpu import PearlNoiseGpu
-        from src.pearl_amd.jackpot import NOISE_RANGE, SEED_LABEL_A, SEED_LABEL_B
+        from .pearl_noise_gpu import PearlNoiseGpu
+        from .jackpot import NOISE_RANGE, SEED_LABEL_A, SEED_LABEL_B
         m, k = A.shape; n, _ = B.shape
         b_noise_seed, _ = commitment_hash
         ng = PearlNoiseGpu(*self._noise_ctx) if any(self._noise_ctx) else PearlNoiseGpu()
@@ -105,7 +106,7 @@ class JackpotVk:
         candidate whose hash (LE uint256) < target. Returns
         ``(Candidate_or_None, attempts, seconds)`` — matches JackpotGpu.search."""
         import time
-        from src.pearl_amd.candidate_search import _axis_constraint, Candidate
+        from .candidate_search import _axis_constraint, Candidate
         rp, cp = mining_config.rows_pattern, mining_config.cols_pattern
         r_mod, r_win = _axis_constraint(rp.shape)
         c_mod, c_win = _axis_constraint(cp.shape)

@@ -39,9 +39,16 @@ takeaway: do the int8 packing first; `subgroupXor` only matters if you don't.
 
 ## Productionized: `JackpotVk` (drop-in for `JackpotGpu`)
 
-`jackpot_vk.cpp` builds to `jackpot_vk.dll` (a C ABI: create / set_job /
-evaluate / destroy, with the device + pipeline + per-job buffers persistent and
-batch buffers reused). `jackpot_vk.py` wraps it via ctypes as **`JackpotVk`**,
+> **Promoted into the package.** The production lib + kernel now live in
+> `src/pearl_amd/vk/` (`jackpot_vk.cpp`, `jackpot.comp`, `build.sh`) and the
+> wrapper at `src/pearl_amd/jackpot_vk.py` (`from pearl_amd.jackpot_vk import
+> JackpotVk`). Build with `src/pearl_amd/vk/build.sh`. The scripts here
+> (validators, microbench host) build against that canonical source. The text
+> below documents the design.
+
+The lib exposes a C ABI (create / set_job / evaluate / destroy, with the
+device + pipeline + per-job buffers persistent and batch buffers reused),
+wrapped via ctypes as **`JackpotVk`**,
 matching `JackpotGpu` (`set_job` derives noise via `PearlNoiseGpu` then uploads;
 `set_job_raw` takes inputs directly; `evaluate_batch` → `(B,32)` hashes).
 `validate_vk.py` checks it **bit-identical to `JackpotGpu`** and benches it
@@ -73,11 +80,11 @@ Wiring into `miner.py` (a `use_vulkan` flag) is the remaining integration step.
 
 ## What's here
 
-- `jackpot.comp` — GLSL port of `jackpot_search_rdna3_wtile.cl`. Compile-time
-  macros: `PEARL_R`, `PEARL_NTILES_W`, `REDUCE_MODE` (0 = LDS tree, 1 =
-  `subgroupXor`).
-- `jackpot_vk.cpp` / `jackpot_vk.py` / `validate_vk.py` — the DLL, ctypes
-  wrapper, and bit-identical validation (above).
+- `../../src/pearl_amd/vk/jackpot.comp` — GLSL port of
+  `jackpot_search_rdna3_wtile.cl` (canonical kernel). Compile-time macros:
+  `PEARL_R`, `PEARL_NTILES_W`, `REDUCE_MODE` (0 = LDS tree, 1 = `subgroupXor`).
+- `validate_vk.py` / `validate_search.py` — bit-identical + throughput
+  validation of the promoted `pearl_amd.jackpot_vk.JackpotVk`.
 - `host.cpp` — Vulkan host (volk). Device-local SSBOs via staging, optional
   `requiredSubgroupSize` (wave32 pin), timestamp timing, readback + bit-identical
   compare against `ref.bin`.

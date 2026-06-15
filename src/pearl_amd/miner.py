@@ -61,6 +61,13 @@ except Exception:  # pragma: no cover — pyopencl missing or no GPU
     JackpotGpu = None  # type: ignore[assignment]
     _GPU_JACKPOT_AVAILABLE = False
 
+try:
+    from .jackpot_vk import JackpotVk  # native Vulkan evaluator (vk/ artifacts)
+    _GPU_VK_AVAILABLE = True
+except Exception:  # pragma: no cover — wrapper import only; DLL checked at build time
+    JackpotVk = None  # type: ignore[assignment]
+    _GPU_VK_AVAILABLE = False
+
 
 log = logging.getLogger("pearl_amd.miner")
 
@@ -162,11 +169,11 @@ class PearlMiner:
         # Vulkan jackpot (experiments/vk_jackpot): ~2.6x the OpenCL kernel.
         # When enabled it takes over set_job + search; A/B are uploaded host->
         # Vulkan once per job (noise derived via the shared OpenCL context).
-        self._use_vulkan_jackpot = use_vulkan_jackpot
+        self._use_vulkan_jackpot = use_vulkan_jackpot and _GPU_VK_AVAILABLE
         self._jackpot_vk = None
         self._jackpot_vk_shape: tuple[int, int, int] | None = None
-        self._use_gpu_jackpot = (use_gpu_jackpot and _GPU_JACKPOT_AVAILABLE
-                                 and not use_vulkan_jackpot)
+        # OpenCL jackpot stays available as a fallback if Vulkan fails to build.
+        self._use_gpu_jackpot = use_gpu_jackpot and _GPU_JACKPOT_AVAILABLE
         # Share one OpenCL context across the GPU helpers so device buffers
         # produced by derive can be consumed by merkle / jackpot without
         # round-tripping 512 MiB matrices through host memory.
@@ -200,23 +207,22 @@ class PearlMiner:
         return self._jackpot_gpu
 
     def _ensure_jackpot_vk(self, h: int, w: int, r: int):
-        """Lazily build the Vulkan jackpot evaluator (loads the DLL from
-        experiments/vk_jackpot). Noise is derived on the shared OpenCL context;
-        A/B are uploaded host->Vulkan in set_job."""
+        """Lazily build the Vulkan jackpot evaluator. Noise is derived on the
+        shared OpenCL context; A/B are uploaded host->Vulkan in set_job. If the
+        native DLL/shaders aren't built, disable Vulkan and fall back to OpenCL."""
         if not self._use_vulkan_jackpot:
             return None
         if self._jackpot_vk is not None and self._jackpot_vk_shape == (h, w, r):
             return self._jackpot_vk
-        import sys as _sys
-        from pathlib import Path as _Path
-        vkdir = str(_Path(__file__).resolve().parents[2] / "experiments" / "vk_jackpot")
-        if vkdir not in _sys.path:
-            _sys.path.insert(0, vkdir)
-        from jackpot_vk import JackpotVk  # type: ignore
         nc = self._derive_gpu.context if self._derive_gpu is not None else None
         nq = self._derive_gpu.queue if self._derive_gpu is not None else None
-        self._jackpot_vk = JackpotVk(h, w, r, noise_context=nc, noise_queue=nq)
-        self._jackpot_vk_shape = (h, w, r)
+        try:
+            self._jackpot_vk = JackpotVk(h, w, r, noise_context=nc, noise_queue=nq)
+            self._jackpot_vk_shape = (h, w, r)
+        except Exception as e:  # DLL/shaders not built, or device init failed
+            self._emit("jackpot_vk_unavailable", error=repr(e))
+            self._use_vulkan_jackpot = False
+            self._jackpot_vk = None
         return self._jackpot_vk
 
     def _emit(self, kind: str, **info: object) -> None:
@@ -291,16 +297,8 @@ class PearlMiner:
         h = len(mc.rows_pattern.to_list())
         w = len(mc.cols_pattern.to_list())
         r = mc.rank
-        jpg = self._ensure_jackpot_gpu(h, w, r)
-        if jpg is not None:
-            t0 = time.time()
-            jpg.set_job(self._A, self._B,
-                        mc.rows_pattern.to_list(), mc.cols_pattern.to_list(),
-                        jm.commitment_hash(), jm.commitment_hash()[1],
-                        A_buf=self._A_buf, B_buf=self._B_buf)
-            self._emit("jackpot_set_job_done", seconds=time.time() - t0,
-                       h=h, w=w, r=r)
-
+        # Prefer the Vulkan evaluator when enabled; else the OpenCL one (which
+        # can reuse the on-device A/B buffers from derive without re-uploading).
         jvk = self._ensure_jackpot_vk(h, w, r)
         if jvk is not None:
             t0 = time.time()
@@ -309,6 +307,16 @@ class PearlMiner:
                         jm.commitment_hash(), jm.commitment_hash()[1])
             self._emit("jackpot_vk_set_job_done", seconds=time.time() - t0,
                        h=h, w=w, r=r)
+        else:
+            jpg = self._ensure_jackpot_gpu(h, w, r)
+            if jpg is not None:
+                t0 = time.time()
+                jpg.set_job(self._A, self._B,
+                            mc.rows_pattern.to_list(), mc.cols_pattern.to_list(),
+                            jm.commitment_hash(), jm.commitment_hash()[1],
+                            A_buf=self._A_buf, B_buf=self._B_buf)
+                self._emit("jackpot_set_job_done", seconds=time.time() - t0,
+                           h=h, w=w, r=r)
 
         return MinerState(
             miner_seed=self.miner_seed,

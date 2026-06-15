@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np, blake3, pyopencl as cl
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(Path(__file__).resolve().parent))
-from jackpot_vk import JackpotVk
+sys.path.insert(0, str(ROOT))
+from src.pearl_amd.jackpot_vk import JackpotVk
 from src.pearl_amd.jackpot_gpu import JackpotGpu
 from src.pearl_amd.mining_config import MiningConfiguration, PeriodicPattern, compute_job_key
 from src.pearl_amd.proof_builder import derive_AB_from_seed, merkle_root_keyed
