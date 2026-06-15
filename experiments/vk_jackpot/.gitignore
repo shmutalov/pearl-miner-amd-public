@@ -1,0 +1,10 @@
+# build artifacts
+*.spv
+*.exe
+*.o
+# vendored at build time (build.sh fetches from github.com/zeux/volk)
+volk.h
+volk.c
+# job dumps live in a scratch dir, but ignore any that land here
+vkjob_*/
+out.bin
