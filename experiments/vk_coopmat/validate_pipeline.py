@@ -86,8 +86,17 @@ def main() -> int:
     ok_exh = "search_exhausted" in events
     print(f"3 exhaust : search_exhausted emitted={ok_exh}")
 
+    # ---- 4: interruptible (should_continue=False) -> prompt return, 0 submits, no hang ----
+    stopped = []
+    miner._submit_hit = lambda w, st, h, a, d: stopped.append(1)
+    t0 = time.time()
+    miner._search_coopmat_pipelined(work, None, should_continue=lambda: False)
+    dt_stop = time.time() - t0
+    ok_stop = len(stopped) == 0
+    print(f"4 interrupt: submitted={len(stopped)} (expect 0), returned in {dt_stop*1000:.0f}ms (no hang)")
+
     jc.close()
-    ok = ok_happy and raised and ok_exh
+    ok = ok_happy and raised and ok_exh and ok_stop
     print("PIPELINE ORCHESTRATION OK" if ok else "PIPELINE **FAILED**")
     return 0 if ok else 1
 

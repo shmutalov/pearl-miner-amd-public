@@ -380,11 +380,14 @@ class PearlMiner:
             A_layers=A_layers, B_layers=B_layers,
         )
 
-    def _search_one_job(self, work: Work, state: MinerState) -> None:
+    def _search_one_job(self, work: Work, state: MinerState,
+                        should_continue=None) -> None:
         """Run candidate search until a hit, until the job changes, or until
         max_attempts is reached. Uses the GPU JackpotGpu evaluator when
         available (batched ~27k cand/s on RX 570), falls back to the pure-
-        Python CPU loop (~80 cand/s) otherwise."""
+        Python CPU loop (~80 cand/s) otherwise. ``should_continue`` is an
+        optional ``() -> bool`` polled by the coopmat path so a Ctrl+C / stop
+        request is honored within ~one tile rather than after the whole round."""
         def progress(attempts: int, dt: float, last_target: int = 0) -> None:
             self._emit("search_progress", attempts=attempts, seconds=dt,
                        rate=attempts / dt if dt > 0 else 0.0,
@@ -395,7 +398,7 @@ class PearlMiner:
         # candidates per share). Stream them so host proof-build + pool submit
         # overlap the GPU search of the next tile (producer/consumer split).
         if self._jackpot_coopmat is not None:
-            self._search_coopmat_pipelined(work, state)
+            self._search_coopmat_pipelined(work, state, should_continue)
             return
 
         t0 = time.time()
@@ -424,15 +427,21 @@ class PearlMiner:
             return
         self._submit_hit(work, state, hit, attempts, dt)
 
-    def _search_coopmat_pipelined(self, work: Work, state: MinerState) -> None:
+    def _search_coopmat_pipelined(self, work: Work, state: MinerState,
+                                  should_continue=None, *, job_slot: int = 0) -> None:
         """One coopmat round with host/GPU overlap. The GPU search (this thread,
         the producer) streams distinct shares tile-by-tile via
-        ``JackpotCoopmat.search_all_stream``; a single consumer thread builds the
-        PlainProof and submits each share to the pool. Because the producer
-        spends its time blocked in the GPU fence wait (GIL released) and submit
-        I/O also releases the GIL, proof-build + network for one tile overlap the
-        GPU search of the next, instead of serializing after the whole sweep.
-        One round = one (A,B) job-space; bounded by coopmat_shares_per_round."""
+        ``JackpotCoopmat.search_all_stream`` reading double-buffered ``job_slot``;
+        a single consumer thread builds the PlainProof and submits each share to
+        the pool. Because the producer spends its time blocked in the GPU fence
+        wait (GIL released) and submit I/O also releases the GIL, proof-build +
+        network for one tile overlap the GPU search of the next, instead of
+        serializing after the whole sweep. One round = one (A,B) job-space;
+        bounded by coopmat_shares_per_round.
+
+        ``should_continue`` (() -> bool) makes the round interruptible: the
+        producer stops the sweep within ~one tile, and the consumer drops any
+        still-queued shares without submitting, so Ctrl+C is honored promptly."""
         jcoop = self._jackpot_coopmat
         t0 = time.time()
         q: queue.Queue = queue.Queue(maxsize=64)
@@ -445,6 +454,8 @@ class PearlMiner:
                 try:
                     if item is None:
                         return
+                    if should_continue is not None and not should_continue():
+                        continue        # stop requested: drop the rest, don't submit
                     self._submit_hit(work, state, item,
                                      jcoop.last_attempts, time.time() - t0)
                     n_submitted[0] += 1
@@ -459,7 +470,8 @@ class PearlMiner:
         try:
             for cand in jcoop.search_all_stream(
                     work.mining_config, work.target,
-                    max_return=self._coopmat_shares_per_round):
+                    max_return=self._coopmat_shares_per_round,
+                    should_continue=should_continue, job_slot=job_slot):
                 q.put(cand)
                 if err:                # consumer died (e.g. pool/socket error)
                     break
@@ -472,6 +484,99 @@ class PearlMiner:
         if n_submitted[0] == 0:
             self._emit("search_exhausted", job_id=work.job_id,
                        attempts=jcoop.last_attempts, seconds=time.time() - t0)
+
+    def _preflight_into(self, work: Work, miner_seed: bytes,
+                        job_slot: int) -> MinerState:
+        """Coopmat-only, side-effect-isolated preflight for the double-buffered
+        continuous loop. Derives A/B from ``miner_seed``, builds Merkle layers,
+        and builds PA/PB into ``job_slot`` — all into locals, never touching the
+        shared ``self._A``/``self._B`` of the round currently searching the other
+        slot. Safe to run on a prefetch thread (OpenCL derive/merkle + Vulkan
+        set_job into the idle slot) concurrently with that search. Returns a
+        self-contained MinerState the consumer can build proofs from."""
+        from .proof_builder import derive_AB_from_seed
+        m, n, k = work.m, work.n, work.mining_config.common_dim
+        if self._derive_gpu is not None:
+            A, B, A_buf, B_buf = self._derive_gpu.derive_AB(miner_seed, m, n, k)
+        else:
+            A, B = derive_AB_from_seed(miner_seed, m, n, k)
+            A_buf = B_buf = None
+
+        job_key = compute_job_key(work.incomplete_header_bytes, work.mining_config)
+        if self._merkle_gpu is not None:
+            if A_buf is not None and (m * k) % 1024 == 0:
+                A_layers = self._merkle_gpu.build_layers(None, job_key, data_buf=A_buf, n_bytes=m * k)
+                B_layers = self._merkle_gpu.build_layers(None, job_key, data_buf=B_buf, n_bytes=n * k)
+            else:
+                A_layers = self._merkle_gpu.build_layers(A.tobytes(), job_key)
+                B_layers = self._merkle_gpu.build_layers(B.tobytes(), job_key)
+        else:
+            A_layers = build_merkle_tree(A.tobytes(), job_key)
+            B_layers = build_merkle_tree(B.tobytes(), job_key)
+
+        jm = JobMatrices(A=A, B=B, miner_seed=miner_seed,
+                         hash_a=A_layers[-1][0], hash_b=B_layers[-1][0],
+                         job_key=job_key, m=m, n=n, k=k)
+        mc = work.mining_config
+        self._jackpot_coopmat.set_job(A, B, mc.rows_pattern, mc.cols_pattern,
+                                      jm.commitment_hash(), jm.commitment_hash()[1],
+                                      job_slot=job_slot)
+        return MinerState(miner_seed=miner_seed, A=A, B=B, job_key=jm.job_key,
+                          job_matrices=jm, A_layers=A_layers, B_layers=B_layers)
+
+    def mine_coopmat_continuous(self, work: Work, *, should_stop,
+                                next_seed, on_round=None) -> None:
+        """Continuously mine one coopmat pool job with cross-round preflight
+        overlap. While round N searches + submits (active job slot), a prefetch
+        thread runs round N+1's full preflight (derive + merkle + set_job) into
+        the IDLE job slot. NJOB=2 double-buffers PA/PB/KEY so the rebuild overlaps
+        the search instead of stalling the GPU between rounds.
+
+        - ``should_stop() -> bool``: polled between and within rounds; the active
+          search bails within ~one tile when it flips True.
+        - ``next_seed() -> bytes``: 32-byte miner seed for the next round (coopmat
+          refreshes the seed each round so the same pool job keeps yielding fresh
+          distinct shares). Called once per round.
+        - ``on_round()``: optional, invoked after each round's search completes.
+
+        Job changes are handled by the caller: have ``should_stop`` flip True when
+        a new pool job arrives, then re-enter with the new ``work``."""
+        mc0 = work.mining_config
+        jcoop = self._jackpot_coopmat or self._ensure_jackpot_coopmat(
+            len(mc0.rows_pattern.to_list()), len(mc0.cols_pattern.to_list()),
+            mc0.rank, mc0.common_dim)
+        if jcoop is None:
+            raise RuntimeError("mine_coopmat_continuous requires the coopmat evaluator")
+        njob = jcoop.NJOB
+        cont = lambda: not should_stop()
+
+        # Round 0 preflight into slot 0 (blocking — nothing to overlap yet).
+        state = self._preflight_into(work, next_seed(), job_slot=0)
+        cur = 0
+        while not should_stop():
+            nxt = (cur + 1) % njob
+            nxt_seed = next_seed()
+            holder: dict = {}
+
+            def _prefetch() -> None:
+                # Build the NEXT round into the idle slot while this round searches.
+                try:
+                    holder["state"] = self._preflight_into(work, nxt_seed, job_slot=nxt)
+                except BaseException as e:  # surface after join; don't kill the GPU thread
+                    holder["err"] = e
+
+            pf = threading.Thread(target=_prefetch, name="coopmat-preflight", daemon=True)
+            pf.start()
+            try:
+                self._search_coopmat_pipelined(work, state, cont, job_slot=cur)
+            finally:
+                pf.join()                       # never leave the prefetch thread running
+            if "err" in holder:
+                raise holder["err"]
+            state = holder["state"]             # promote the prebuilt slot to current
+            cur = nxt
+            if on_round is not None:
+                on_round()
 
     def _submit_hit(self, work: Work, state: MinerState, hit,
                     attempts: int, dt: float) -> None:

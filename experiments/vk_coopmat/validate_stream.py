@@ -70,8 +70,22 @@ def main() -> int:
     ok_cap = len(capped) == 7
     print(f"max_return=7 honored: {ok_cap} (got {len(capped)})")
 
+    # Interruptible: stop from the 3rd tile-check onward -> fewer shares, no hang,
+    # and the slots stay reusable (a normal stream afterward still returns the
+    # full set, proving in-flight tiles were drained and fences left signaled).
+    calls = [0]
+    def cont():
+        calls[0] += 1
+        return calls[0] <= 2
+    part = list(jc.search_all_stream(mc, target, max_return=BIG, chunk_wg=CHUNK,
+                                     should_continue=cont))
+    after = list(jc.search_all_stream(mc, target, max_return=BIG, chunk_wg=CHUNK))
+    ok_interrupt = len(part) < len(stream) and len(after) == len(stream)
+    print(f"interrupt: stopped early ({len(part)} < {len(stream)}) and slots reusable "
+          f"(after={len(after)}): {ok_interrupt}")
+
     jc.close()
-    ok = ok_count and ok_set and ok_attempts and ok_cap
+    ok = ok_count and ok_set and ok_attempts and ok_cap and ok_interrupt
     print("STREAM EQUIVALENT TO search_all" if ok else "STREAM **MISMATCH**")
     return 0 if ok else 1
 

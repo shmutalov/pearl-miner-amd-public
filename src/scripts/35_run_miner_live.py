@@ -181,15 +181,33 @@ def main() -> int:
                 if stop_evt.is_set():
                     break
 
-                # Coopmat: each round uses a fresh (A,B) so the same pool job
-                # keeps yielding distinct shares (no duplicate submissions).
                 if args.coopmat:
-                    miner.miner_seed = os.urandom(32)
-                    miner._A = None
-                # Manually drive _preflight + _search_one_job per job, so
-                # we can break out cleanly when stop_evt fires.
+                    # Continuous coopmat mining: round N+1's preflight (derive +
+                    # merkle + set_job into the idle double-buffered job slot) runs
+                    # on a prefetch thread while round N searches the active slot,
+                    # so the per-round rebuild overlaps the search. Each round
+                    # refreshes the seed, so the same pool job keeps yielding fresh
+                    # distinct shares. The loop exits (and the outer loop re-enters
+                    # with the new work) when stop_evt fires or the pool ships a new
+                    # job; the round itself is interruptible within ~one tile.
+                    job_key = work.job_key
+                    def _should_stop() -> bool:
+                        if stop_evt.is_set() or sess.is_disconnected():
+                            return True
+                        cw = sess.current_work()
+                        return cw is not None and cw.job_key != job_key
+                    miner.mine_coopmat_continuous(
+                        work, should_stop=_should_stop,
+                        next_seed=lambda: os.urandom(32))
+                    continue
+
+                # Non-coopmat: one preflight + one search per job, so we can break
+                # out cleanly when stop_evt fires. Passing the stop predicate makes
+                # the round interruptible (~one tile) instead of running to
+                # completion before Ctrl+C is seen.
                 state = miner._preflight(work)
-                miner._search_one_job(work, state)
+                miner._search_one_job(work, state,
+                                      should_continue=lambda: not stop_evt.is_set())
         finally:
             print(f"[{_ts()}] done. hits_submitted={hits_submitted[0]}, "
                   f"session_stats={sess.stats()}")

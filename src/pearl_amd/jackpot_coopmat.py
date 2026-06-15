@@ -25,8 +25,10 @@ _DLL = _VK / "jackpot_coopmat_vk.dll"
 _POOL_ROWS = [0, 32]
 _POOL_COLS = list(range(64))
 
-# Number of ping-pong search slots in the DLL (jackpot_coopmat_vk.cpp NSLOT).
+# Ping-pong search slots and double-buffered job slots in the DLL
+# (jackpot_coopmat_vk.cpp NSLOT / NJOB).
 _NSLOT = 2
+_NJOB = 2
 
 
 def _ptr(arr, ctype):
@@ -48,16 +50,19 @@ class JackpotCoopmat:
         self.lib = C.CDLL(str(_DLL))
         self.lib.jcm_create.restype = c_void_p
         self.lib.jcm_create.argtypes = [C.c_char_p, C.c_char_p, c_int, c_int, c_int, c_int]
-        self.lib.jcm_set_job.restype = c_int
-        self.lib.jcm_set_job.argtypes = [c_void_p, POINTER(c_int8), POINTER(c_int8),
+        # Build PA/PB/KEY into a given double-buffered job slot (slot 0 == the
+        # old single-job behaviour).
+        self.lib.jcm_set_job_slot.restype = c_int
+        self.lib.jcm_set_job_slot.argtypes = [c_void_p, c_int, POINTER(c_int8), POINTER(c_int8),
             POINTER(c_int8), POINTER(c_int8), POINTER(c_uint32), POINTER(c_uint32),
             POINTER(c_uint32), c_int, c_int]
         self.lib.jcm_search_tile.restype = c_int
         self.lib.jcm_search_tile.argtypes = [c_void_p, POINTER(c_uint8), c_int64, c_int,
                                              POINTER(c_uint32), POINTER(c_int)]
-        # Async ping-pong split: submit a tile on a slot (no wait), collect later.
+        # Async ping-pong split: submit a tile on (search slot, job slot) without
+        # waiting; collect later. job slot selects the double-buffered PA/PB/KEY.
         self.lib.jcm_search_submit.restype = c_int
-        self.lib.jcm_search_submit.argtypes = [c_void_p, c_int, POINTER(c_uint8),
+        self.lib.jcm_search_submit.argtypes = [c_void_p, c_int, c_int, POINTER(c_uint8),
                                                c_int64, c_int]
         self.lib.jcm_search_collect.restype = c_int
         self.lib.jcm_search_collect.argtypes = [c_void_p, c_int, POINTER(c_uint32),
@@ -77,6 +82,9 @@ class JackpotCoopmat:
         # collect per slot so the producer never aliases a buffer being read.
         self._rec = [np.empty((max_hits, 10), dtype=np.uint32) for _ in range(_NSLOT)]
         self.last_attempts = 0
+        self.NSLOT, self.NJOB = _NSLOT, _NJOB
+        # Keep each job slot's upload arrays alive across its set_job call.
+        self._hold = [None] * _NJOB
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -88,7 +96,7 @@ class JackpotCoopmat:
                 f"coopmat path requires rows_pattern={_POOL_ROWS}, cols_pattern=[0..63]; "
                 f"got rows={rl}, cols={cl[:4]}...")
 
-    def set_job_raw(self, A, B, e_al, e_br_t, e_ar_t, e_bl, a_noise_seed):
+    def set_job_raw(self, A, B, e_al, e_br_t, e_ar_t, e_bl, a_noise_seed, job_slot=0):
         A = np.ascontiguousarray(A, dtype=np.int8)
         B = np.ascontiguousarray(B, dtype=np.int8)
         m, k = A.shape; n, k2 = B.shape
@@ -98,16 +106,18 @@ class JackpotCoopmat:
         e_ar_t = np.ascontiguousarray(e_ar_t, dtype=np.uint32).reshape(-1)
         e_bl = np.ascontiguousarray(e_bl, dtype=np.uint32).reshape(-1)
         key = np.frombuffer(a_noise_seed, dtype=np.uint32).copy()
-        self._hold = (A, B, e_al, e_br_t, e_ar_t, e_bl, key)
-        rc = self.lib.jcm_set_job(self.ctx, _ptr(A, c_int8), _ptr(B, c_int8),
+        self._hold[job_slot] = (A, B, e_al, e_br_t, e_ar_t, e_bl, key)
+        rc = self.lib.jcm_set_job_slot(self.ctx, job_slot, _ptr(A, c_int8), _ptr(B, c_int8),
             _ptr(e_al, c_int8), _ptr(e_br_t, c_int8), _ptr(e_ar_t, c_uint32), _ptr(e_bl, c_uint32),
             _ptr(key, c_uint32), m, n)
         if rc != 0:
-            raise RuntimeError(f"jcm_set_job failed ({rc})")
+            raise RuntimeError(f"jcm_set_job_slot failed ({rc})")
         self._m, self._n = m, n
 
-    def set_job(self, A, B, row_pattern, col_pattern, commitment_hash, a_noise_seed):
-        """JackpotGpu-compatible. Derives noise (noise_rank=r) then builds PA/PB."""
+    def set_job(self, A, B, row_pattern, col_pattern, commitment_hash, a_noise_seed,
+                job_slot=0):
+        """JackpotGpu-compatible. Derives noise (noise_rank=r) then builds PA/PB
+        into ``job_slot`` (the double-buffered slot the next round will search)."""
         self._check_pattern(row_pattern, col_pattern)
         from .pearl_noise_gpu import PearlNoiseGpu
         from .jackpot import SEED_LABEL_A, SEED_LABEL_B
@@ -118,7 +128,7 @@ class JackpotCoopmat:
         e_ar_t, _ = ng.perm(SEED_LABEL_A, a_noise_seed, k, self.r, read_back=True)
         e_bl, _ = ng.perm(SEED_LABEL_B, b_noise_seed, k, self.r, read_back=True)
         e_br_t, _ = ng.uniform(SEED_LABEL_B, b_noise_seed, n, self.r, read_back=True)
-        self.set_job_raw(A, B, e_al, e_br_t, e_ar_t, e_bl, a_noise_seed)
+        self.set_job_raw(A, B, e_al, e_br_t, e_ar_t, e_bl, a_noise_seed, job_slot=job_slot)
 
     # ------------------------------------------------------------------ #
     def search(self, mining_config, target: int, *, batch_size: int = 16384,
@@ -244,7 +254,7 @@ class JackpotCoopmat:
         return out, attempts, time.time() - t0
 
     def search_all_stream(self, mining_config, target: int, *, max_return: int = 256,
-                          chunk_wg: int = 300_000):
+                          chunk_wg: int = 300_000, should_continue=None, job_slot=0):
         """Streaming variant of :meth:`search_all`: yield distinct ``Candidate``
         shares one tile at a time while the *next* tile is already running on the
         GPU (the ``_NSLOT`` ping-pong slots in the DLL). The caller can build
@@ -253,6 +263,11 @@ class JackpotCoopmat:
         serializing after it. Stops once ``max_return`` shares are yielded or the
         whole (band x block) grid is swept. After exhaustion, ``self.last_attempts``
         holds the candidate count scanned.
+
+        ``should_continue`` is an optional ``() -> bool`` predicate checked once
+        per tile; when it returns False the sweep stops refilling and yielding
+        (still draining the <=_NSLOT in-flight tiles so fences stay clean), so a
+        Ctrl+C / job change is honored within ~one tile instead of a whole round.
 
         Slot discipline: tiles are submitted in order across alternating slots
         and collected in submission order via a FIFO; each slot is always
@@ -275,7 +290,7 @@ class JackpotCoopmat:
         def _submit(slot: int, idx: int) -> int:
             wg_off = offsets[idx]
             this = min(chunk_wg, total_wg - wg_off)
-            rc = self.lib.jcm_search_submit(self.ctx, slot, _ptr(tgt, c_uint8),
+            rc = self.lib.jcm_search_submit(self.ctx, slot, job_slot, _ptr(tgt, c_uint8),
                                             wg_off, this)
             if rc != 0:
                 raise RuntimeError(f"jcm_search_submit failed ({rc})")
@@ -304,11 +319,15 @@ class JackpotCoopmat:
             slot, _idx, wgc = fifo.popleft()
             saved = min(_collect(slot), self.max_hits)
             attempts += wgc * 32
+            self.last_attempts = attempts
+            stop = should_continue is not None and not should_continue()
             # Refill this slot with the next tile BEFORE we drain its hits, so the
             # GPU starts the next dispatch while the caller processes this batch.
-            if next_idx < n_tiles and yielded < max_return:
+            if next_idx < n_tiles and yielded < max_return and not stop:
                 fifo.append((slot, next_idx, _submit(slot, next_idx)))
                 next_idx += 1
+            if stop:                       # drain remaining in-flight tiles, no yield
+                continue
             rec = self._rec[slot]
             for i in range(saved):
                 if yielded >= max_return:
@@ -321,7 +340,6 @@ class JackpotCoopmat:
                     b_cols_indices=list(cp.indices_with_offset(t_c)),
                     hash_jackpot=hb, target_value=int.from_bytes(hb, "little"))
                 yielded += 1
-            self.last_attempts = attempts
 
     def last_gpu_ms(self, slot: int = 0) -> float:
         return float(self.lib.jcm_last_gpu_ms(self.ctx, slot))
