@@ -60,6 +60,8 @@ def main() -> int:
                     help="use the Vulkan jackpot evaluator (~2.6x; experiments/vk_jackpot)")
     ap.add_argument("--coopmat", action="store_true",
                     help="use the amortized-GEMM + tensor-core evaluator (~44x; pool pattern only)")
+    ap.add_argument("--coopmat-batch", type=int, default=64,
+                    help="coopmat: distinct shares to find+submit per round")
     ap.add_argument("--seed-hex", default=None,
                     help="32-byte miner seed; default = random")
     ap.add_argument("--submit", action="store_true",
@@ -147,6 +149,7 @@ def main() -> int:
             jackpot_batch_size=args.jackpot_batch_size,
             use_vulkan_jackpot=args.vulkan,
             use_coopmat_jackpot=args.coopmat,
+            coopmat_shares_per_round=args.coopmat_batch,
         )
         print(f"[{_ts()}] PearlMiner ready: derive_gpu={miner._derive_gpu is not None}, "
               f"merkle_gpu={miner._merkle_gpu is not None}, "
@@ -178,6 +181,11 @@ def main() -> int:
                 if stop_evt.is_set():
                     break
 
+                # Coopmat: each round uses a fresh (A,B) so the same pool job
+                # keeps yielding distinct shares (no duplicate submissions).
+                if args.coopmat:
+                    miner.miner_seed = os.urandom(32)
+                    miner._A = None
                 # Manually drive _preflight + _search_one_job per job, so
                 # we can break out cleanly when stop_evt fires.
                 state = miner._preflight(work)

@@ -157,6 +157,7 @@ class PearlMiner:
                  use_gpu_jackpot: bool = True,
                  use_vulkan_jackpot: bool = False,
                  use_coopmat_jackpot: bool = False,
+                 coopmat_shares_per_round: int = 64,
                  jackpot_batch_size: int = 8192) -> None:
         if len(miner_seed) != 32:
             raise ValueError("miner_seed must be 32 bytes")
@@ -187,6 +188,7 @@ class PearlMiner:
         self._use_coopmat_jackpot = use_coopmat_jackpot and _GPU_COOPMAT_AVAILABLE
         self._jackpot_coopmat = None
         self._jackpot_coopmat_shape: tuple[int, int, int, int] | None = None
+        self._coopmat_shares_per_round = coopmat_shares_per_round
         # OpenCL jackpot stays available as a fallback if Vulkan fails to build.
         self._use_gpu_jackpot = use_gpu_jackpot and _GPU_JACKPOT_AVAILABLE
         # Share one OpenCL context across the GPU helpers so device buffers
@@ -388,14 +390,22 @@ class PearlMiner:
                        last_target_lz=(256 - last_target.bit_length()
                                        if last_target > 0 else 256))
 
-        t0 = time.time()
+        # Coopmat: one job-space yields many distinct shares (≈ share_difficulty
+        # candidates per share). Find and submit a whole round of them.
         if self._jackpot_coopmat is not None:
-            # Tensor-core grid sweep in TDR-safe tiles; bounded by max_attempts.
-            hit, attempts, dt = self._jackpot_coopmat.search(
+            hits, attempts, dt = self._jackpot_coopmat.search_all(
                 work.mining_config, work.target,
-                batch_size=self.jackpot_batch_size,
-                max_attempts=self.max_attempts_per_job)
-        elif self._jackpot_vk is not None:
+                max_return=self._coopmat_shares_per_round)
+            if not hits:
+                self._emit("search_exhausted", job_id=work.job_id,
+                           attempts=attempts, seconds=dt)
+                return
+            for hit in hits:
+                self._submit_hit(work, state, hit, attempts, dt)
+            return
+
+        t0 = time.time()
+        if self._jackpot_vk is not None:
             # Native search loop runs to a hit / max_attempts in one call (no
             # mid-run progress_cb); the miner bounds it via max_attempts_per_job.
             hit, attempts, dt = self._jackpot_vk.search(
@@ -418,20 +428,21 @@ class PearlMiner:
             self._emit("search_exhausted", job_id=work.job_id,
                        attempts=attempts, seconds=dt)
             return
+        self._submit_hit(work, state, hit, attempts, dt)
 
+    def _submit_hit(self, work: Work, state: MinerState, hit,
+                    attempts: int, dt: float) -> None:
+        """Assemble the PlainProof for one hit and submit it."""
         self._emit("hit_found", job_id=work.job_id,
                    attempts=attempts, seconds=dt,
                    t_rows=hit.t_rows, t_cols=hit.t_cols,
                    hash=hit.hash_jackpot.hex())
-
         t1 = time.time()
         proof = build_plain_proof(state.job_matrices, work.mining_config,
                                   state.A_layers, state.B_layers, hit)
         proof_bytes = proof.encode()
-        t2 = time.time()
         self._emit("proof_built", proof_bytes=len(proof_bytes),
-                   build_seconds=t2 - t1)
-
+                   build_seconds=time.time() - t1)
         t3 = time.time()
         resp = self.session.submit_share(work.job_id, proof_bytes)
         self._emit("submit_done", response=resp, seconds=time.time() - t3)
