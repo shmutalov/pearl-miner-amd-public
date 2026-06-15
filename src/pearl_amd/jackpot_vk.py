@@ -79,13 +79,13 @@ class JackpotVk:
     def set_job(self, A, B, row_pattern, col_pattern, commitment_hash, a_noise_seed):
         """JackpotGpu-compatible: derive noise on the GPU, then upload to Vulkan."""
         from .pearl_noise_gpu import PearlNoiseGpu
-        from .jackpot import NOISE_RANGE, SEED_LABEL_A, SEED_LABEL_B
+        from .jackpot import SEED_LABEL_A, SEED_LABEL_B
         m, k = A.shape; n, _ = B.shape
         b_noise_seed, _ = commitment_hash
         ng = PearlNoiseGpu(*self._noise_ctx) if any(self._noise_ctx) else PearlNoiseGpu()
         e_al, _ = ng.uniform(SEED_LABEL_A, a_noise_seed, m, self.r, read_back=True)
-        e_ar_t, _ = ng.perm(SEED_LABEL_A, a_noise_seed, k, NOISE_RANGE // 2, read_back=True)
-        e_bl, _ = ng.perm(SEED_LABEL_B, b_noise_seed, k, NOISE_RANGE // 2, read_back=True)
+        e_ar_t, _ = ng.perm(SEED_LABEL_A, a_noise_seed, k, self.r, read_back=True)
+        e_bl, _ = ng.perm(SEED_LABEL_B, b_noise_seed, k, self.r, read_back=True)
         e_br_t, _ = ng.uniform(SEED_LABEL_B, b_noise_seed, n, self.r, read_back=True)
         self.set_job_raw(A, B, e_al, e_br_t, e_ar_t, e_bl, row_pattern, col_pattern, a_noise_seed)
 
