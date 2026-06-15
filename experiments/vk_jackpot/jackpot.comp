@@ -2,10 +2,16 @@
 // Vulkan/GLSL port of jackpot_search_rdna3_wtile.cl. Bit-identical; built to
 // A/B the WG-wide XOR reduce: REDUCE_MODE 0 = LDS tree (full barriers),
 // 1 = subgroupXor + cross-subgroup combine. Compile-time shape via -D macros.
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#extension GL_EXT_shader_8bit_storage : require
+//
+// Shared strips are packed 4x int8 per uint in *plain* shared memory: this
+// matches the OpenCL kernel's compact LDS footprint (int8 shared *blocks* via
+// workgroup_memory_explicit_layout miscompiled here), keeps occupancy high, and
+// makes the inner product a 4-wide int8 dot. Each thread writes a full uint, so
+// there is no read-modify-write race on the byte lanes.
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
 
 #ifndef PEARL_H
 #define PEARL_H 2
@@ -31,41 +37,35 @@
 #define JACKPOT_SIZE 16
 #define LROT_PER_TILE 13u
 
-// Shared strips are int (32-bit). int8 shared would quarter the LDS footprint
-// (the point of the w-tiling) and match the OpenCL kernel, but int8 explicit-
-// layout shared *blocks* miscompiled on this glslang/driver (aliasing observed),
-// so we use int and recover occupancy by tiling harder (NTILES_W up to 16).
-// TODO: compact LDS via manual 4xint8->uint packing in plain shared.
-#define SH_W(x) (x)
-#define SH_R(x) (x)
-
 layout(local_size_x = WG_SIZE) in;
 
-// SSBO bindings (mirror the OpenCL arg order).
 layout(std430, binding = 0)  readonly buffer A_b   { int8_t v[]; } A;
 layout(std430, binding = 1)  readonly buffer B_b   { int8_t v[]; } B;
 layout(std430, binding = 2)  readonly buffer EAL_b { int8_t v[]; } EAL;     // e_al   (m,r)
 layout(std430, binding = 3)  readonly buffer EBR_b { int8_t v[]; } EBR;     // e_br_t (n,r)
 layout(std430, binding = 4)  readonly buffer EAR_b { uvec2  v[]; } EAR;     // e_ar_t (k,2)
 layout(std430, binding = 5)  readonly buffer EBL_b { uvec2  v[]; } EBL;     // e_bl   (k,2)
-layout(std430, binding = 6)  readonly buffer TR_b  { int    v[]; } TR;      // t_rows
-layout(std430, binding = 7)  readonly buffer TC_b  { int    v[]; } TC;      // t_cols
-layout(std430, binding = 8)  readonly buffer RP_b  { int    v[]; } RP;      // row_pattern
-layout(std430, binding = 9)  readonly buffer CP_b  { int    v[]; } CP;      // col_pattern
-layout(std430, binding = 10) readonly buffer KEY_b { uint   v[]; } KEY;     // a_noise_seed (8)
-layout(std430, binding = 11) writeonly buffer OUT_b{ uint   v[]; } OUTH;    // (B,8)
+layout(std430, binding = 6)  readonly buffer TR_b  { int    v[]; } TR;
+layout(std430, binding = 7)  readonly buffer TC_b  { int    v[]; } TC;
+layout(std430, binding = 8)  readonly buffer RP_b  { int    v[]; } RP;
+layout(std430, binding = 9)  readonly buffer CP_b  { int    v[]; } CP;
+layout(std430, binding = 10) readonly buffer KEY_b { uint   v[]; } KEY;
+layout(std430, binding = 11) writeonly buffer OUT_b{ uint   v[]; } OUTH;
 
 layout(push_constant) uniform PC { int n_cols_A; int n_cols_B; int k; } pc;
 
-// Plain shared arrays (int strips; revisit int8 packing as an optimization).
-shared int  el_al[PEARL_H  * PEARL_R];
-shared int  el_br[PEARL_TW * PEARL_R];
-shared int  pa   [PEARL_H  * PEARL_R];
-shared int  pb   [PEARL_TW * PEARL_R];
+// Packed shared strips: 4 int8 per uint (plain shared, no explicit-layout block).
+shared uint el_al[(PEARL_H  * PEARL_R) / 4];
+shared uint el_br[(PEARL_TW * PEARL_R) / 4];
+shared uint pa   [(PEARL_H  * PEARL_R) / 4];
+shared uint pb   [(PEARL_TW * PEARL_R) / 4];
 shared uint xor_scratch[WG_SIZE];
 shared uint sg_partial[WG_SIZE / 32];
 shared uint jackpot_msg[JACKPOT_SIZE];
 shared uint tile_acc[PEARL_MAX_ITERS];
+
+// Sign-extending read of byte lane (fidx&3) from a packed shared array.
+#define GET(arr, fidx) bitfieldExtract(int(arr[(fidx) >> 2]), 8 * ((fidx) & 3), 8)
 
 uint rotr32(uint x, uint n) { return (x >> n) | (x << (32u - n)); }
 
@@ -76,15 +76,13 @@ void g(inout uint v[16], int a, int b, int c, int d, uint mx, uint my) {
     v[c] = v[c] + v[d];      v[b] = rotr32(v[b] ^ v[c],  7u);
 }
 
-// One BLAKE3 keyed root-block compress over m_in[16]; out first 8 words.
 void blake3_compress(out uint outw[8], uint key[8], uint m[16]) {
     uint v[16];
     v[0]=key[0]; v[1]=key[1]; v[2]=key[2]; v[3]=key[3];
     v[4]=key[4]; v[5]=key[5]; v[6]=key[6]; v[7]=key[7];
     v[8]=0x6A09E667u; v[9]=0xBB67AE85u; v[10]=0x3C6EF372u; v[11]=0xA54FF53Au;
     v[12]=0u; v[13]=0u; v[14]=64u;
-    v[15]= 0x01u | 0x02u | 0x08u | 0x10u; // CHUNK_START|CHUNK_END|ROOT|KEYED_HASH
-
+    v[15]= 0x01u | 0x02u | 0x08u | 0x10u;
     #define RND(s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,sa,sb,sc,sd,se,sf) \
         g(v,0,4,8, 12, m[s0],m[s1]); g(v,1,5,9, 13, m[s2],m[s3]); \
         g(v,2,6,10,14, m[s4],m[s5]); g(v,3,7,11,15, m[s6],m[s7]); \
@@ -107,16 +105,18 @@ void main() {
     int tid  = int(gl_LocalInvocationID.x);
     int u    = tid / PEARL_W;
     int v    = tid % PEARL_W;
-
     int t_r = TR.v[cand];
     int t_c = TC.v[cand];
-
     int n_iters = pc.k / PEARL_R;
 
-    for (int idx = tid; idx < PEARL_H * PEARL_R; idx += WG_SIZE) {
-        int uL = idx / PEARL_R, lL = idx % PEARL_R;
+    // el_al packed: each thread packs 4 consecutive l into one uint.
+    for (int pg = tid; pg < (PEARL_H * PEARL_R) / 4; pg += WG_SIZE) {
+        int base = pg * 4, uL = base / PEARL_R, l0 = base % PEARL_R;
         int row = t_r + RP.v[uL];
-        el_al[idx] = SH_W(int(EAL.v[row * PEARL_R + lL]));
+        uint word = 0u;
+        for (int j = 0; j < 4; ++j)
+            word |= (uint(int(EAL.v[row * PEARL_R + l0 + j]) & 0xFF) << (8 * j));
+        el_al[pg] = word;
     }
     for (int idx = tid; idx < JACKPOT_SIZE; idx += WG_SIZE) jackpot_msg[idx] = 0u;
     for (int idx = tid; idx < n_iters;     idx += WG_SIZE) tile_acc[idx]    = 0u;
@@ -127,47 +127,62 @@ void main() {
         int v_local  = v - col_base;
         bool in_tile = (v_local >= 0) && (v_local < PEARL_TW);
 
-        for (int idx = tid; idx < PEARL_TW * PEARL_R; idx += WG_SIZE) {
-            int vt = idx / PEARL_R, lL = idx % PEARL_R;
+        for (int pg = tid; pg < (PEARL_TW * PEARL_R) / 4; pg += WG_SIZE) {
+            int base = pg * 4, vt = base / PEARL_R, l0 = base % PEARL_R;
             int col = t_c + CP.v[col_base + vt];
-            el_br[idx] = SH_W(int(EBR.v[col * PEARL_R + lL]));
+            uint word = 0u;
+            for (int j = 0; j < 4; ++j)
+                word |= (uint(int(EBR.v[col * PEARL_R + l0 + j]) & 0xFF) << (8 * j));
+            el_br[pg] = word;
         }
         barrier();
 
         for (int iter = 0; iter < n_iters; ++iter) {
             int ll_lo = iter * PEARL_R;
 
-            for (int idx = tid; idx < PEARL_H * PEARL_R; idx += WG_SIZE) {
-                int uu = idx / PEARL_R, lL = idx % PEARL_R;
-                int gl = ll_lo + lL;
-                int row = t_r + RP.v[uu];
-                uvec2 par = EAR.v[gl];
-                int na = SH_R(el_al[uu * PEARL_R + int(par.x)]) - SH_R(el_al[uu * PEARL_R + int(par.y)]);
-                int sa = int(A.v[row * pc.n_cols_A + gl]);
-                pa[idx] = SH_W(sa + na);
+            for (int pg = tid; pg < (PEARL_H * PEARL_R) / 4; pg += WG_SIZE) {
+                int base = pg * 4, uu = base / PEARL_R, l0 = base % PEARL_R;
+                int row = t_r + RP.v[uu], fa = uu * PEARL_R;
+                uint word = 0u;
+                for (int j = 0; j < 4; ++j) {
+                    int gl = ll_lo + l0 + j;
+                    uvec2 par = EAR.v[gl];
+                    int na = GET(el_al, fa + int(par.x)) - GET(el_al, fa + int(par.y));
+                    int sa = int(A.v[row * pc.n_cols_A + gl]);
+                    word |= (uint((sa + na) & 0xFF) << (8 * j));
+                }
+                pa[pg] = word;
             }
-            for (int idx = tid; idx < PEARL_TW * PEARL_R; idx += WG_SIZE) {
-                int vt = idx / PEARL_R, lL = idx % PEARL_R;
-                int gl = ll_lo + lL;
-                int col = t_c + CP.v[col_base + vt];
-                uvec2 pbl = EBL.v[gl];
-                int nb = SH_R(el_br[vt * PEARL_R + int(pbl.x)]) - SH_R(el_br[vt * PEARL_R + int(pbl.y)]);
-                int sb = int(B.v[col * pc.n_cols_B + gl]);
-                pb[idx] = SH_W(sb + nb);
+            for (int pg = tid; pg < (PEARL_TW * PEARL_R) / 4; pg += WG_SIZE) {
+                int base = pg * 4, vt = base / PEARL_R, l0 = base % PEARL_R;
+                int col = t_c + CP.v[col_base + vt], fb = vt * PEARL_R;
+                uint word = 0u;
+                for (int j = 0; j < 4; ++j) {
+                    int gl = ll_lo + l0 + j;
+                    uvec2 pbl = EBL.v[gl];
+                    int nb = GET(el_br, fb + int(pbl.x)) - GET(el_br, fb + int(pbl.y));
+                    int sb = int(B.v[col * pc.n_cols_B + gl]);
+                    word |= (uint((sb + nb) & 0xFF) << (8 * j));
+                }
+                pb[pg] = word;
             }
             barrier();
 
             int acc = 0;
             if (in_tile) {
-                int pa_base = u * PEARL_R;
-                int pb_base = v_local * PEARL_R;
-                for (int l = 0; l < PEARL_R; ++l)
-                    acc += SH_R(pa[pa_base + l]) * SH_R(pb[pb_base + l]);
+                int paw = (u * PEARL_R) >> 2;
+                int pbw = (v_local * PEARL_R) >> 2;
+                for (int gw = 0; gw < PEARL_R / 4; ++gw) {
+                    uint pw = pa[paw + gw], qw = pb[pbw + gw];
+                    acc += bitfieldExtract(int(pw),0,8)  * bitfieldExtract(int(qw),0,8)
+                         + bitfieldExtract(int(pw),8,8)  * bitfieldExtract(int(qw),8,8)
+                         + bitfieldExtract(int(pw),16,8) * bitfieldExtract(int(qw),16,8)
+                         + bitfieldExtract(int(pw),24,8) * bitfieldExtract(int(qw),24,8);
+                }
             }
 
             uint reduced;
 #if REDUCE_MODE == 0
-            // LDS tree reduce with full barriers (correct on any subgroup size).
             xor_scratch[tid] = uint(acc);
             barrier();
             for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1) {
@@ -177,7 +192,6 @@ void main() {
             reduced = xor_scratch[0];
             barrier();
 #else
-            // subgroupXor over each subgroup, then combine partials in LDS.
             uint part = subgroupXor(uint(acc));
             if (subgroupElect()) sg_partial[gl_SubgroupID] = part;
             barrier();
@@ -192,16 +206,15 @@ void main() {
     if (tid == 0) {
         uint key[8];
         for (int i = 0; i < 8; ++i) key[i] = KEY.v[i];
-        uint msg[16];
         for (int iter = 0; iter < n_iters; ++iter) {
             int slot = iter % JACKPOT_SIZE;
             uint cur = jackpot_msg[slot];
             uint rot = (cur << LROT_PER_TILE) | (cur >> (32u - LROT_PER_TILE));
             jackpot_msg[slot] = rot ^ tile_acc[iter];
         }
+        uint msg[16];
         for (int i = 0; i < JACKPOT_SIZE; ++i) msg[i] = jackpot_msg[i];
 #ifdef DEBUG_MSG
-        // Emit the first 8 jackpot_msg words (pre-hash) for validation.
         for (int i = 0; i < 8; ++i) OUTH.v[cand * 8 + i] = jackpot_msg[i];
 #else
         uint h[8];

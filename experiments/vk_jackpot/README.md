@@ -8,21 +8,34 @@ driver does. This isolates that one lever.
 
 ## Result (RX 7900 XT / gfx1100, pool shape m=n=131072, k=4096)
 
-All variants verified **bit-identical** to the OpenCL/CPU reference.
+All variants verified **bit-identical** to the OpenCL/CPU reference. Throughput
+is pure GPU time (Vulkan timestamps / OpenCL CL profiling events), batch=16384.
 
-| w-tiles | V0: LDS-tree reduce | V1: `subgroupXor` (wave32) | V1 gain |
-|---|---|---|---|
-| 4  | 167k cand/s | 202k | +21% |
-| 8  | 218k cand/s | 276k | +27% |
-| 16 | 266k cand/s | 281k | +6%  |
+**Headline — packed int8 LDS, apples-to-apples GPU time:**
 
-**`subgroupXor` beats the LDS-tree reduce at every tiling** — the reduce was on
-the critical path, and Vulkan's subgroup arithmetic (unreachable from this
-OpenCL driver) is a genuine win for this latency-bound kernel.
+| Kernel | cand/s |
+|---|---|
+| OpenCL `jackpot_search_rdna3_wtile.cl` (int8, char4) | 382k |
+| **Vulkan packed int8, NTILES=4** | **989k (~2.6×)** |
 
-For reference the production OpenCL `jackpot_search_rdna3_wtile.cl` does ~338k
-cand/s. The Vulkan port trails it **only because of the int8-shared caveat
-below**, not the reduce — see caveats.
+The win is the **inner loop**, not the reduce. Packing 4×int8 into each
+`shared uint` and doing a 4-wide byte dot lets the Vulkan LLPC backend schedule
+it far better than the AMD OpenCL compiler (very likely auto-emitting
+`v_dot4_i32_i8` — the int8 hardware dot we thought was unreachable, reached via
+the compiler rather than an extension). Still only ~0.5% of int8 peak, so the
+kernel remains gather-bound; this is a scheduling/ISA win, not hitting compute.
+
+**The `subgroupXor` lever depends on the inner loop being the bottleneck:**
+
+| LDS strips | V0 LDS-tree | V1 `subgroupXor` |
+|---|---|---|
+| int (32-bit), NTILES=8 | 218k | 276k (**+27%**) |
+| packed int8, NTILES=4  | 988k | 989k (**~0%**) |
+
+When the inner loop is inefficient (int shared), the reduce is a big fraction
+and `subgroupXor` helps a lot. Once the inner loop is fast (packed int8), the
+reduce is no longer the bottleneck and the subgroup advantage vanishes. Honest
+takeaway: do the int8 packing first; `subgroupXor` only matters if you don't.
 
 ## What's here
 
@@ -48,31 +61,34 @@ below**, not the reduce — see caveats.
 ./run.sh small 256      # fast correctness gate
 ```
 
-## Caveats
+## Notes / caveats
 
-- **int shared, not int8.** The strips live in 32-bit `shared int` arrays.
-  int8 *shared* needs `VK_KHR_workgroup_memory_explicit_layout` blocks, which
-  miscompiled here (member aliasing — `tile_acc` writes landed in
-  `jackpot_msg`), so we fell back to int and recovered occupancy by tiling
-  harder (`NTILES_W` up to 16). This 4x-larger LDS is the whole reason the
-  Vulkan port (281k) trails the OpenCL int8 kernel (338k); it is **not** the
-  reduce. Closing the gap = compact LDS via manual `4×int8→uint` packing in
-  plain shared (TODO).
-- **V0 baseline is pessimistic**: it uses a full `barrier()` between every tree
-  step, more than the OpenCL kernel's lockstep-optimized reduce. The honest
-  takeaway is the *V1-over-V0 delta*, and that V1 reaches a reduce the OpenCL
-  driver can't.
+- **int8 in shared = manual packing, not blocks.** int8 *shared* via
+  `VK_KHR_workgroup_memory_explicit_layout` blocks miscompiled here (member
+  aliasing — `tile_acc` writes landed in `jackpot_msg`). The working approach is
+  4×int8 packed into each plain `shared uint`, with each thread writing a full
+  uint (no read-modify-write race) and the inner product unpacking 4-at-a-time
+  via `bitfieldExtract`. This both restores the compact LDS footprint *and* is
+  what unlocks the LLPC inner-loop win above.
+- **Fair timing.** Vulkan = GPU timestamps; OpenCL = CL profiling events
+  (`measure_ocl_gpu.py`) — both pure kernel time, no host/alloc/readback. The
+  ~338k you may see from `JackpotGpu.evaluate_batch` wall-time is burdened by
+  per-batch buffer alloc + readback + Python; the kernel itself is 382k.
+- This is a spike, not productionized: single fixed shape per `.spv`, no
+  multi-GPU, host hardcodes device[0].
 
 ## Next step: RGP
 
-The remaining question — *is the noise gather LDS-bank-conflict bound?* (which
-would justify a `subgroupShuffle` gather rewrite) — needs Radeon GPU Profiler:
+Two open questions for the Radeon GPU Profiler:
 
-1. Launch **Radeon Developer Panel**, enable profiling.
-2. Run `host.exe <spv> <job_dir> --reps 200` so the dispatch repeats long
-   enough to capture.
-3. Capture an RGP profile; read **LDS bank-conflict %**, wave occupancy, and the
-   VALU/LDS/VMEM instruction mix.
-   - High bank-conflict % on the pa/pb build → green-light a `subgroupShuffle`
-     gather (V3) and likely a full Vulkan port.
-   - Low → we're near the form's ceiling; keep the OpenCL kernel in production.
+1. **Confirm the inner-loop win's mechanism** — disassemble the packed shader's
+   ISA and check whether LLPC emitted `v_dot4_i32_i8` for the byte-dot. If so,
+   the same packing trick could be hand-forced in OpenCL (or at least explains
+   the 2.6×).
+2. **Is the pa/pb build LDS-bank-conflict bound?** If yes, a `subgroupShuffle`
+   gather (keeping the noise rows in registers) is the next lever; if not, we're
+   near the form's ceiling.
+
+How: launch **Radeon Developer Panel**, run `host.exe <spv> <job_dir>
+--reps 200`, capture, and read the ISA + **LDS bank-conflict %**, occupancy, and
+VALU/LDS/VMEM mix.
