@@ -158,6 +158,7 @@ class StratumConfig:
     solver: str = "gpu"              # "gpu" (OpenCL) or "cpu" (multiprocessing)
     solver_workers: int | None = None  # CPU solver only
     connect_timeout_sec: float = 15.0
+    log_raw: bool = False            # log every inbound JSON-RPC line (share verdicts)
 
 
 class StratumClient:
@@ -265,10 +266,19 @@ class StratumClient:
         return self._disconnected.wait(timeout)
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
+        # Raw trace of everything the pool sends — the only place a share's
+        # async accept/reject verdict (sent as a notification, not in the
+        # mining.submit response) becomes visible. Enable via cfg.log_raw.
+        if self.cfg.log_raw:
+            self._on_log(f"<< {json.dumps(msg, separators=(',', ':'))[:600]}")
         method = msg.get("method")
         if method is None:
             # response to a call we made
             rid = msg.get("id")
+            # Surface RPC-level failures even without log_raw (a rejected submit
+            # usually comes back async, but a synchronous error shows up here).
+            if msg.get("error") or msg.get("result") is False:
+                self._on_log(f"rpc non-ok id={rid}: {json.dumps(msg)[:300]}")
             if rid is not None:
                 with self._lock:
                     self._responses[int(rid)] = msg

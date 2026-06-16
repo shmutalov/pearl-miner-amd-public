@@ -535,98 +535,103 @@ class PearlMiner:
             self._emit("search_exhausted", job_id=work.job_id,
                        attempts=jcoop.last_attempts, seconds=time.time() - t0)
 
+    def _ensure_pearl_noise_gpu(self):
+        """Lazily build the OpenCL noise generator used for the protocol-correct
+        dense/pool/perm derivation (uniform == device dense_noise, perm ==
+        extract_sparse_indices). Own context — small and independent of the
+        coopmat Vulkan device."""
+        png = getattr(self, "_pearl_noise_gpu", None)
+        if png is None:
+            from .pearl_noise_gpu import PearlNoiseGpu
+            png = PearlNoiseGpu()
+            self._pearl_noise_gpu = png
+        return png
+
     def _preflight_into(self, work: Work, miner_seed: bytes,
                         job_slot: int) -> MinerState:
-        """Coopmat-only, side-effect-isolated preflight for the double-buffered
-        continuous loop. Derives A/B from ``miner_seed``, builds Merkle layers,
-        and builds PA/PB into ``job_slot`` — all into locals, never touching the
-        shared ``self._A``/``self._B`` of the round currently searching the other
-        slot. Safe to run on a prefetch thread (OpenCL derive/merkle + Vulkan
-        set_job into the idle slot) concurrently with that search. Returns a
-        self-contained MinerState the consumer can build proofs from."""
-        from .proof_builder import derive_AB_from_seed
-        m, n, k = work.m, work.n, work.mining_config.common_dim
-        if self._derive_gpu is not None:
-            A, B, A_buf, B_buf = self._derive_gpu.derive_AB(miner_seed, m, n, k)
-        else:
-            A, B = derive_AB_from_seed(miner_seed, m, n, k)
-            A_buf = B_buf = None
-
-        job_key = compute_job_key(work.incomplete_header_bytes, work.mining_config)
-        if self._merkle_gpu is not None:
-            if A_buf is not None and (m * k) % 1024 == 0:
-                A_layers = self._merkle_gpu.build_layers(None, job_key, data_buf=A_buf, n_bytes=m * k)
-                B_layers = self._merkle_gpu.build_layers(None, job_key, data_buf=B_buf, n_bytes=n * k)
-            else:
-                A_layers = self._merkle_gpu.build_layers(A.tobytes(), job_key)
-                B_layers = self._merkle_gpu.build_layers(B.tobytes(), job_key)
-        else:
-            A_layers = build_merkle_tree(A.tobytes(), job_key)
-            B_layers = build_merkle_tree(B.tobytes(), job_key)
-
-        jm = JobMatrices(A=A, B=B, miner_seed=miner_seed,
-                         hash_a=A_layers[-1][0], hash_b=B_layers[-1][0],
-                         job_key=job_key, m=m, n=n, k=k)
+        """Coopmat preflight, protocol-correct. The matrices are NOT miner-chosen:
+        they are derived from the per-job seed ``S = job_key`` exactly as the pool
+        re-derives them — dense base ``dense_noise(S, A_te/B_te)`` plus the low-rank
+        sparse overlay — so our committed roots match the pool's. The per-cell hash
+        key is ``hash_a`` (the A Merkle root). ``miner_seed`` is ignored (kept for
+        signature compatibility); distinct shares come from distinct tiles, not from
+        reseeding. Builds PA/PB into ``job_slot`` via set_job_raw (pmat rebuilds the
+        same A_final/B_final device-side from dense+pool+perm)."""
+        import numpy as np
+        from .jackpot import SEED_LABEL_A, SEED_LABEL_B, apply_sparse_noise
         mc = work.mining_config
-        self._jackpot_coopmat.set_job(A, B, mc.rows_pattern, mc.cols_pattern,
-                                      jm.commitment_hash(), jm.commitment_hash()[1],
-                                      job_slot=job_slot)
-        return MinerState(miner_seed=miner_seed, A=A, B=B, job_key=jm.job_key,
-                          job_matrices=jm, A_layers=A_layers, B_layers=B_layers)
+        m, n, k, r = work.m, work.n, mc.common_dim, mc.rank
+        S = compute_job_key(work.incomplete_header_bytes, mc)   # per-job seed == job_key
+        ng = self._ensure_pearl_noise_gpu()
+
+        def _derive(which: int, label: bytes, rows: int):
+            dense = np.asarray(ng.uniform(label, S, rows, k, read_back=True)[0]).reshape(rows, k).astype(np.int8)
+            pool = np.asarray(ng.uniform(label, S, rows, r, read_back=True)[0]).reshape(rows, r).astype(np.int8)
+            perm = np.asarray(ng.perm(label, S, k, r, read_back=True)[0]).reshape(k, 2).astype(np.uint32)
+            final = apply_sparse_noise(dense, pool, perm[:, 0], perm[:, 1])
+            return dense, pool, perm, final
+
+        dA, poolA, permA, A_final = _derive(1, SEED_LABEL_A, m)   # which=1 -> "A_te"
+        dB, poolB, permB, B_final = _derive(0, SEED_LABEL_B, n)   # which=0 -> "B_te"
+
+        if self._merkle_gpu is not None:
+            A_layers = self._merkle_gpu.build_layers(A_final.tobytes(), S)
+            B_layers = self._merkle_gpu.build_layers(B_final.tobytes(), S)
+        else:
+            A_layers = build_merkle_tree(A_final.tobytes(), S)
+            B_layers = build_merkle_tree(B_final.tobytes(), S)
+        hash_a, hash_b = A_layers[-1][0], B_layers[-1][0]
+
+        jm = JobMatrices(A=A_final, B=B_final, miner_seed=S,
+                         hash_a=hash_a, hash_b=hash_b, job_key=S, m=m, n=n, k=k)
+        # set_job_raw(A, B, e_al, e_br_t, e_ar_t, e_bl, key): pmat builds
+        # PA = A + e_al[perm.x] - e_al[perm.y] == A_final, likewise PB.
+        self._jackpot_coopmat.set_job_raw(dA, dB, poolA, poolB, permA, permB,
+                                          hash_a, job_slot=job_slot)
+        return MinerState(miner_seed=S, A=A_final, B=B_final, job_key=S,
+                          job_matrices=jm, A_layers=A_layers, B_layers=B_layers,
+                          a_bytes=A_final.tobytes(), b_bytes=B_final.tobytes())
 
     def mine_coopmat_continuous(self, work: Work, *, should_stop,
-                                next_seed, on_round=None) -> None:
-        """Continuously mine one coopmat pool job with cross-round preflight
-        overlap. While round N searches + submits (active job slot), a prefetch
-        thread runs round N+1's full preflight (derive + merkle + set_job) into
-        the IDLE job slot. NJOB=2 double-buffers PA/PB/KEY so the rebuild overlaps
-        the search instead of stalling the GPU between rounds.
+                                next_seed=None, on_round=None) -> None:
+        """Mine one coopmat pool job, protocol-correct. The job's matrices are
+        FIXED by the seed S=job_key (the pool re-derives the same ones), so we do
+        ONE preflight, sweep the whole (band x block) grid, and submit every tile
+        whose digest is below target. Distinct shares = distinct tiles (no
+        per-round reseed — that was the old, pool-rejected model).
 
-        - ``should_stop() -> bool``: polled between and within rounds; the active
-          search bails within ~one tile when it flips True.
-        - ``next_seed() -> bytes``: 32-byte miner seed for the next round (coopmat
-          refreshes the seed each round so the same pool job keeps yielding fresh
-          distinct shares). Called once per round.
-        - ``on_round()``: optional, invoked after each round's search completes.
+        - ``should_stop() -> bool``: polled per tile; the sweep bails within ~one
+          tile, and the post-sweep idle exits, when it flips True.
+        - ``next_seed``: accepted for signature compatibility but IGNORED.
+        - ``on_round()``: optional, invoked once the job is done.
 
-        Job changes are handled by the caller: have ``should_stop`` flip True when
-        a new pool job arrives, then re-enter with the new ``work``."""
-        mc0 = work.mining_config
+        Job changes/disconnects are handled by the caller: have ``should_stop``
+        flip True when a new pool job arrives or the link drops, then re-enter with
+        the new ``work``."""
+        mc = work.mining_config
         jcoop = self._jackpot_coopmat or self._ensure_jackpot_coopmat(
-            len(mc0.rows_pattern.to_list()), len(mc0.cols_pattern.to_list()),
-            mc0.rank, mc0.common_dim)
+            len(mc.rows_pattern.to_list()), len(mc.cols_pattern.to_list()),
+            mc.rank, mc.common_dim)
         if jcoop is None:
             raise RuntimeError("mine_coopmat_continuous requires the coopmat evaluator")
-        njob = jcoop.NJOB
         cont = lambda: not should_stop()
 
-        # Round 0 preflight into slot 0 (blocking — nothing to overlap yet).
-        state = self._preflight_into(work, next_seed(), job_slot=0)
-        cur = 0
+        # One protocol-correct preflight: the job's matrices are fixed by S.
+        state = self._preflight_into(work, None, job_slot=0)
+        # Sweep the whole (band x block) grid once, submitting every tile below
+        # target. Distinct shares come from distinct tiles, not from reseeding.
+        for hit in jcoop.search_all_stream(mc, work.target, max_return=1_000_000,
+                                           should_continue=cont, job_slot=0):
+            if should_stop():
+                break
+            self._submit_hit(work, state, hit, jcoop.last_attempts, 0.0)
+        # All shares for this job are submitted; idle until the job changes (or we
+        # disconnect) so we don't re-derive/re-submit the same job. should_stop()
+        # flips on a new job or a dropped connection; the caller re-enters.
         while not should_stop():
-            nxt = (cur + 1) % njob
-            nxt_seed = next_seed()
-            holder: dict = {}
-
-            def _prefetch() -> None:
-                # Build the NEXT round into the idle slot while this round searches.
-                try:
-                    holder["state"] = self._preflight_into(work, nxt_seed, job_slot=nxt)
-                except BaseException as e:  # surface after join; don't kill the GPU thread
-                    holder["err"] = e
-
-            pf = threading.Thread(target=_prefetch, name="coopmat-preflight", daemon=True)
-            pf.start()
-            try:
-                self._search_coopmat_pipelined(work, state, cont, job_slot=cur)
-            finally:
-                pf.join()                       # never leave the prefetch thread running
-            if "err" in holder:
-                raise holder["err"]
-            state = holder["state"]             # promote the prebuilt slot to current
-            cur = nxt
-            if on_round is not None:
-                on_round()
+            time.sleep(0.5)
+        if on_round is not None:
+            on_round()
 
     def _submit_hit(self, work: Work, state: MinerState, hit,
                     attempts: int, dt: float) -> None:

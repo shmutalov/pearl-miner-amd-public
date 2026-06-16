@@ -129,6 +129,26 @@ def matvec_sparse_perm(perm: np.ndarray, vec: np.ndarray) -> np.ndarray:
     return diff.astype(np.int8)
 
 
+def apply_sparse_noise(dense: np.ndarray, pool: np.ndarray,
+                       idxA: np.ndarray, idxB: np.ndarray) -> np.ndarray:
+    """Final committed matrix = dense base + low-rank sparse overlay, exactly as
+    the device ``apply_sparse_noise_kernel`` computes it (verified bit-identical
+    to the RDNA3 ISA):
+
+        out[m, l] = int8( dense[m, l] + pool[m, idxA[l]] - pool[m, idxB[l]] )
+
+    ``dense`` is (rows, k) int8, ``pool`` is (rows, noise_rank) int8/uint8, and
+    ``idxA``/``idxB`` are the (k,) permutation index columns (= the two columns of
+    :func:`generate_permutation_matrix`). The int8() cast wraps mod 256.
+    """
+    d = np.asarray(dense).astype(np.int16)
+    p = np.asarray(pool).astype(np.uint8)
+    ia = np.asarray(idxA).astype(np.int64).ravel()
+    ib = np.asarray(idxB).astype(np.int64).ravel()
+    out = (d + p[:, ia].astype(np.int16) - p[:, ib].astype(np.int16)) & 0xFF
+    return out.astype(np.int8)
+
+
 def compute_noise_for_indices(k: int, noise_rank: int,
                               commitment_hash: tuple[bytes, bytes],
                               a_rows_indices: list[int],

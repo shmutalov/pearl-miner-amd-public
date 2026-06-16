@@ -81,6 +81,10 @@ def main() -> int:
     ap.add_argument("--summary-interval-sec", type=float, default=300.0,
                     help="print the D-tuning summary every N seconds while mining "
                          "(each covers the window since the last); 0 = only at exit")
+    ap.add_argument("--log-raw", action="store_true",
+                    help="log every inbound stratum message (diagnostic): reveals "
+                         "the pool's async share accept/reject verdicts, which the "
+                         "mining.submit 'result: true' does NOT carry")
     args = ap.parse_args()
 
     if args.seed_hex:
@@ -97,6 +101,7 @@ def main() -> int:
     cfg = StratumConfig(
         host=args.host, port=args.port,
         address=args.address, worker=args.worker, password=args.password,
+        log_raw=args.log_raw,
     )
 
     stop_evt = threading.Event()
@@ -264,23 +269,29 @@ def main() -> int:
                 tune["D"] = work.share_difficulty
 
                 if args.coopmat:
-                    # Continuous coopmat mining: round N+1's preflight (derive +
-                    # merkle + set_job into the idle double-buffered job slot) runs
-                    # on a prefetch thread while round N searches the active slot,
-                    # so the per-round rebuild overlaps the search. Each round
-                    # refreshes the seed, so the same pool job keeps yielding fresh
-                    # distinct shares. The loop exits (and the outer loop re-enters
-                    # with the new work) when stop_evt fires or the pool ships a new
-                    # job; the round itself is interruptible within ~one tile.
+                    # Coopmat mining: derive the protocol-correct matrices from the
+                    # job seed S=job_key (one preflight; the pool re-derives the
+                    # same ones), sweep the whole grid and submit every tile below
+                    # target. Distinct shares = distinct tiles (no reseed). The call
+                    # returns (and the outer loop re-enters with the new work) when
+                    # stop_evt fires or the pool ships a new job; interruptible
+                    # within ~one tile.
                     job_key = work.job_key
                     def _should_stop() -> bool:
                         if stop_evt.is_set() or sess.is_disconnected():
                             return True
                         cw = sess.current_work()
                         return cw is not None and cw.job_key != job_key
-                    miner.mine_coopmat_continuous(
-                        work, should_stop=_should_stop,
-                        next_seed=lambda: os.urandom(32))
+                    try:
+                        miner.mine_coopmat_continuous(
+                            work, should_stop=_should_stop,
+                            next_seed=lambda: os.urandom(32))
+                    except ConnectionError as e:
+                        # Pool dropped us mid-submit: stop cleanly (print the
+                        # summary) instead of crashing with a traceback.
+                        print(f"[{_ts()}] session lost during mining: {e!r}")
+                        stop_evt.set()
+                        break
                     continue
 
                 # Non-coopmat: one preflight + one search per job, so we can break
