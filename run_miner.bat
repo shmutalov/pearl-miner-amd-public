@@ -44,7 +44,11 @@ echo   Pool   : %POOL_HOST%:%POOL_PORT%
 echo   Path   : coopmat (tensor cores) + submit
 echo.
 
-"%PY%" src\scripts\35_run_miner_live.py --host "%POOL_HOST%" --port %POOL_PORT% --address "%ADDRESS%" --worker "%WORKER%" --coopmat --coopmat-batch %COOPMAT_BATCH% --max-hits %MAX_HITS% --observe-seconds %OBSERVE_SECONDS% --submit --coopmat-submit-threads 8 --password "x;d=3000000"
+REM  --password "x;d=N": request the LOWEST difficulty the pool allows so the
+REM  (correct, pdiff) share target is actually reachable on this GPU. d=1 ->
+REM  target needs >=32 leading-zero bits (the pdiff floor). Raise this only
+REM  AFTER the dashboard confirms shares are being CREDITED.
+"%PY%" src\scripts\35_run_miner_live.py --host "%POOL_HOST%" --port %POOL_PORT% --address "%ADDRESS%" --worker "%WORKER%" --coopmat --coopmat-batch %COOPMAT_BATCH% --max-hits %MAX_HITS% --observe-seconds %OBSERVE_SECONDS% --submit --password "x;d=1"
 
 echo.
 echo   Miner exited (code %ERRORLEVEL%).

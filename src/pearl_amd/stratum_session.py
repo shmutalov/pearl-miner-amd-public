@@ -196,17 +196,28 @@ class StratumSession:
                 self._on_log(f"  [session] failed to derive mining_config/job_key: {e!r}")
                 return
             try:
-                # Pearl credits each attempt as H_PER_ATTEMPT = 2^32 hash-equivalents
-                # (the miner's TH/s = attempts * 2^32 / time / 1e12). So a share is
-                # ACCEPTED when its scaled difficulty 2^256/hash >= share_difficulty,
-                # i.e. hash <= 2^256/D = (raw nbits target = 2^224/D) << 32. Searching
-                # at the raw nbits target (32 bits too strict) finds ~nothing; the
-                # scaled target makes expected candidates/share = D. Verified live:
-                # a target_lz~29 hash is accepted at D=50000 (raw nbits target_lz~47).
-                _raw = nbits_hex_to_target(self._latest_notify["share_nbits"])
-                target = min(_raw << 32, (1 << 256) - 1)
+                # Share target = classic stratum pdiff, VERIFIED end-to-end by
+                # ARC-miner on alphapool (shares credited, no shim):
+                #     Diff1Target = 0xFFFF << 208  (~2^224)
+                #     target      = Diff1Target / D        (D from set_difficulty)
+                # The previous code shifted this LEFT by 32 (`_raw << 32`), which
+                # was WRONG: it conflated the pool's HASHRATE ACCOUNTING (it credits
+                # ~2^32 hash-equivalents per attempt when *estimating* your TH/s)
+                # with the SHARE-VALIDITY target (consensus). That made us search
+                # 2^32 too loose. The pdiff floor proves it: even D=1 has the top
+                # 32 target bits zero, so ANY valid share needs >=32 leading-zero
+                # bits; the <<32 accepted hits at lz~15-29 -> every share below the
+                # minimum valid difficulty -> pool "too many bad proofs" -> ban.
+                # (cross-check: ARC StratumSession.DifficultyToNbits, Diff1Target.)
+                DIFF1_TARGET = 0xFFFF << 208
+                D = self._latest_diff
+                if D and float(D) > 0:
+                    target = max(1, DIFF1_TARGET // int(float(D)))
+                else:
+                    # No set_difficulty yet — fall back to the notify nbits as-is.
+                    target = nbits_hex_to_target(self._latest_notify["share_nbits"])
             except Exception as e:
-                self._on_log(f"  [session] failed to decode share_nbits: {e!r}")
+                self._on_log(f"  [session] failed to derive share target: {e!r}")
                 return
             work = Work(
                 job_id=self._latest_notify["job_id"],
