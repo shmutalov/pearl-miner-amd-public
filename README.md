@@ -5,37 +5,42 @@ gfx803) via OpenCL — the cheapest 8 GiB cards nobody wants — and now runs th
 hot path on **RDNA3** (RX 7900 XT, gfx1100) tensor cores via Vulkan
 `cooperative_matrix`. Just-for-fun research project.
 
-> **Status: submits shares, but pool acceptance is NOT yet confirmed — this
-> miner does not (yet) earn.** The full pipeline runs against real pool stratum
-> (`eu1.alphapool.tech:5566`) — handshake, BLAKE3 challenge, mining params,
-> per-job preflight, GPU candidate search, PlainProof assembly, share submit.
-> The pool returns `result:true` to each submit, but that only means **parsed
-> and queued**, not credited: as of 2026-06-19 the dashboard shows **zero
-> accepted shares**, and a burst of submits drew a
-> `[25,"too many bad proofs; temporary ban"]` — so the proofs are still being
-> rejected by the pool's async validation. Root-cause debugging is ongoing
-> (see the acknowledgements + notes below).
+> **Status: shares accepted — it earns (modestly).** Verified live on
+> **HeroMiners** (`*.pearl.herominers.com:1200`, TLS) on 2026-06-19: a run
+> submitted **26 shares, 26 valid / 0 invalid**, credited to the dashboard with
+> an unconfirmed balance, at ~9.5 TH/s (1 h avg, the pool's display metric). The
+> full pipeline runs end-to-end — handshake, mining params, per-job preflight,
+> GPU candidate search, PlainProof assembly, submit — and the proofs pass the
+> pool's validation. One 7900 XT is a small contributor (≈ break-even on power),
+> but the shares are *accepted*, which is the point.
 >
-> What *is* real and measured is GPU throughput: the amortized-GEMM +
-> cooperative_matrix evaluator hits **~37–38 M candidate-jackpots/s on an
-> RX 7900 XT** (≈ 37 TH/s by the protocol's `attempts × 2³² / s` *display*
-> metric). That is raw evaluator throughput — **not** an accepted-share rate.
+> Pool note: use a **standard-stratum** pool (HeroMiners, Kryptex). **AlphaPool**
+> validates against a non-standard per-job target — even the reference ARC-miner
+> is rejected there on a direct connect (its docs recommend a proxy), and our own
+> attempts drew a `[25,"too many bad proofs; temporary ban"]`. The two stratum
+> dialects are auto-detected (challenge-first à la AlphaPool vs client-first à la
+> HeroMiners); see `run_miner.bat` / `run_miner_herominers.bat`.
 >
-> Correctness fixes made while chasing acceptance — each cross-checked
-> bit-for-bit against the Akoya/ARC reference, but **none yet confirmed by a
-> credited share**:
-> - **jackpot fold**: the tile must be the **cumulative** running partial-GEMM
->   sum folded at each `rank`-block boundary, not the per-`rank`-slice block
+> GPU throughput: the amortized-GEMM + cooperative_matrix evaluator hits
+> **~36–38 M candidate-jackpots/s on an RX 7900 XT** (≈ 37 TH/s by the protocol's
+> `attempts × 2³² / s` *display* metric). On HeroMiners' floor difficulty for a
+> small miner (~2 M) that's roughly one valid share per minute; each is worth its
+> full difficulty, so they're high-value but infrequent.
+>
+> The correctness fixes that got there (each cross-checked bit-for-bit against the
+> Akoya/ARC reference, then **confirmed by credited shares**):
+> - **share target = `diff_target × DifficultyAdjustmentFactor`**, where
+>   `DAF = rows.size × cols.size × dot_product_length` (= 2×64×4096 = **2¹⁹** for
+>   the live shape). Akoya `MiningConfiguration.DifficultyAdjustmentFactor` /
+>   `GpuWorker.InstallSigmaHalf`. An earlier `nbits<<32` (2³²) was 2¹³ too loose
+>   → sub-target "bad proofs"; a pdiff-only attempt was 2¹⁹ too strict.
+> - **jackpot fold**: the tile is the **cumulative** running partial-GEMM sum
+>   folded at each `rank`-block boundary, not the per-`rank`-slice block
 >   (matches Akoya `JackpotComputer`).
-> - **perm `noise_rank`** must use `r`, not `NOISE_RANGE//2` (=64) — wrong noise
->   whenever `rank ≠ 64`.
-> - **share target** is the classic stratum pdiff `(0xFFFF<<208)/D ≈ 2²²⁴/D`
->   (matches ARC-miner, which *is* credited on this pool). An earlier version
->   shifted it left 32 bits (`2²⁵⁶/D`), conflating the pool's hashrate
->   *accounting* (~2³² hash-equivalents credited per attempt) with the
->   share-*validity* target — making every hit ~2³² too easy (below even the
->   D=1 floor of 32 leading-zero bits). That was the direct cause of the
->   "bad proofs" ban.
+> - **perm `noise_rank`** must use `r`, not `NOISE_RANGE//2` (=64).
+> - **dialect + shape**: client-first object stratum (object authorize / notify /
+>   submit) over TLS, with the miner *declaring* HeroMiners' canonical mainnet
+>   shape (m=n=131072, k=4096, **noise_rank=256**) since the pool doesn't send it.
 
 ## What's interesting here
 
@@ -145,22 +150,26 @@ python -m venv .venv
     --max-attempts-per-job 100000
 ```
 
-On an RX 7900 XT, build the Vulkan bits once and mine on tensor cores — this
-submits shares to the pool continuously (**acceptance not yet confirmed — see
-Status**). Request a low difficulty so the pdiff share target is reachable,
-e.g. `--password "x;d=1"`:
+On an RX 7900 XT, build the Vulkan bits once and mine on tensor cores against a
+standard-stratum pool (HeroMiners). This submits **pool-accepted** shares (see
+Status). The simplest path is the launcher `run_miner_herominers.bat` (edit the
+wallet); equivalently:
 
 ```bash
-bash src/pearl_amd/vk/build.sh        # one-time: glslc + MinGW g++
+bash src/pearl_amd/vk/build.sh        # one-time: glslc + MinGW g++ (compiles r=64,128,256)
 
 .venv/Scripts/python.exe src/scripts/35_run_miner_live.py \
+    --host ca.pearl.herominers.com --port 1200 --tls \
     --address <your-prl1...-wallet> --worker rx7900xt \
     --coopmat --submit --coopmat-batch 64
 ```
 
-Add `--submit` to post shares (default is dry-run). `--coopmat` routes the
-search through the tensor-core evaluator (falls back to `--vulkan`, then
-OpenCL, then CPU if unavailable).
+`--tls` is required for HeroMiners/Kryptex (`stratum+tls://`); omit it for plain
+TCP pools. `--submit` actually posts shares (default is dry-run). `--coopmat`
+routes the search through the tensor-core evaluator (falls back to `--vulkan`,
+then OpenCL, then CPU). The stratum dialect (challenge-first vs client-first) and
+the mining shape are auto-detected / declared, so just point `--host`/`--port`
+at any standard Pearl stratum pool.
 
 ## Limitations / what's NOT here
 
@@ -249,8 +258,8 @@ gitignored), each a ctypes drop-in selected by a miner flag:
   display metric (`attempts × 2³² / s / 1e12`), 37 M cand/s ≈ **37 TH/s**.
 
 The whole chain is validated bit-identical to `evaluate_candidate` at the pool
-shape, and runs end-to-end against the live pool (submits shares; **pool
-acceptance not yet confirmed — see Status**). Build:
+shape, and runs end-to-end against the live pool with **pool-accepted shares**
+(see Status). Build:
 
 ```bash
 bash src/pearl_amd/vk/build.sh    # needs LunarG Vulkan SDK (glslc) + MinGW g++
