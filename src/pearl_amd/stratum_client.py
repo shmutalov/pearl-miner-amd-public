@@ -162,6 +162,16 @@ class StratumConfig:
     log_raw: bool = False            # log every inbound JSON-RPC line (share verdicts)
     tls: bool = False                # wrap the socket in TLS (HeroMiners/Kryptex
                                      # use stratum+tls://; AlphaPool is plain TCP)
+    challenge_wait_sec: float = 2.0  # wait this long for a pool-first
+                                     # pearl.challenge before assuming the pool
+                                     # is client-first (HeroMiners/suprnova)
+    # Client-first pools don't send pearl.set_mining_params; the miner DECLARES
+    # the canonical mainnet shape (HeroMiners-family: m=n=131072, k=4096,
+    # noise_rank=256 — Akoya WorkerOrchestrator). Used only when dialect=client.
+    declared_m: int = 131072
+    declared_n: int = 131072
+    declared_k: int = 4096
+    declared_rank: int = 256
 
 
 class StratumClient:
@@ -192,6 +202,7 @@ class StratumClient:
         self._stop = threading.Event()
         self._disconnected = threading.Event()  # set when reader_loop exits (clean or error)
         self._authorized = False
+        self.dialect = "auto"            # set by handshake(): "challenge" | "client"
 
     # -- transport -------------------------------------------------------- #
 
@@ -344,27 +355,28 @@ class StratumClient:
     # -- high level handshake -------------------------------------------- #
 
     def handshake(self) -> None:
-        """Run mining.configure + mining.subscribe + solve challenge + authorize.
+        """Auto-detect the pool dialect and complete login (blocks until the
+        authorize response arrives). Sets ``self.dialect``.
 
-        Blocks until ``mining.authorize`` returns a result.
+        Two dialects share this client:
+          * challenge-first (pearl/v1, AlphaPool): the pool SPEAKS FIRST with
+            ``pearl.challenge`` ~150 ms after connect. Solve it, then
+            configure / subscribe / array-form authorize.
+          * client-first (HeroMiners, suprnova): silent until we authorize —
+            NO configure/subscribe/challenge, just object-form
+            ``mining.authorize {wallet, worker, agent}``.
+
+        Detection: wait briefly for a ``pearl.challenge``; silence within the
+        window means client-first.
         """
         cfg = self.cfg
+        if not cfg.address:
+            raise ValueError("StratumConfig.address is required")
 
-        # configure / subscribe go out first; both responses are usually
-        # innocuous (often {"result":{"pearl/v1":true}} / true), but we still
-        # send them because the binary does.
-        self._send({"id": self._next_request_id(),
-                    "method": "mining.configure",
-                    "params": [["pearl/v1"], {}]})
-        self._send({"id": self._next_request_id(),
-                    "method": "mining.subscribe",
-                    "params": [cfg.user_agent]})
-
-        # Wait for the first pearl.challenge to land. We use a lightweight
-        # spin since the dispatcher pushes the seed/difficulty via callback.
+        # Install the challenge capture BEFORE sending anything so a pool that
+        # speaks first can't race us.
         challenge_seen = threading.Event()
         challenge_state: dict[str, Any] = {}
-
         original_cb = self._on_challenge
         def _capture(seed: str, diff: int) -> None:
             if not challenge_seen.is_set():
@@ -375,8 +387,20 @@ class StratumClient:
                 original_cb(seed, diff)
         self._on_challenge = _capture
 
-        if not challenge_seen.wait(timeout=15.0):
-            raise TimeoutError("no pearl.challenge received within 15s")
+        if not challenge_seen.wait(timeout=cfg.challenge_wait_sec):
+            self.dialect = "client"
+            self._client_first_authorize()
+            return
+
+        # --- challenge-first (pearl/v1) ---
+        self.dialect = "challenge"
+        # configure / subscribe (AlphaPool expects these alongside the challenge).
+        self._send({"id": self._next_request_id(),
+                    "method": "mining.configure",
+                    "params": [["pearl/v1"], {}]})
+        self._send({"id": self._next_request_id(),
+                    "method": "mining.subscribe",
+                    "params": [cfg.user_agent]})
 
         seed = challenge_state["seed"]
         diff = challenge_state["difficulty"]
@@ -424,22 +448,47 @@ class StratumClient:
         self._authorized = True
         self._on_log(f"authorized user={user}")
 
+    def _client_first_authorize(self) -> None:
+        """Client-first dialect (HeroMiners, suprnova): no challenge, no
+        configure, no subscribe — just an object-form ``mining.authorize``
+        ``{wallet, worker, agent}`` (Akoya StratumSession client-first path).
+        set_difficulty / notify may arrive before the auth ack; the reader
+        thread dispatches those via callbacks, so the by-id ``_call`` below
+        still resolves on the ack regardless of arrival order."""
+        cfg = self.cfg
+        self._on_log("dialect=client-first (no pearl.challenge) — authorizing directly")
+        params = {"wallet": cfg.address, "worker": cfg.worker, "agent": cfg.user_agent}
+        auth_resp = self._call("mining.authorize", params, timeout=20.0)
+        if auth_resp.get("error"):
+            raise RuntimeError(f"authorize rejected: {auth_resp['error']}")
+        if auth_resp.get("result") is False:
+            raise RuntimeError(f"authorize returned false: {auth_resp}")
+        self._authorized = True
+        self._on_log(f"authorized (client-first) wallet={cfg.address} worker={cfg.worker}")
+
     # -- share submission ------------------------------------------------- #
 
     def submit_share(self, job_id: str, plain_proof: bytes) -> dict[str, Any]:
-        """Submit a share. Wire format (confirmed by live probe 2026-05-24):
+        """Submit a share, dialect-aware (Akoya StratumSession.SubmitShare):
 
-            params = [worker_username, job_id, base64(plain_proof_bytes)]
+          * challenge-first (pearl/v1, AlphaPool): positional array
+            ``params = [worker_username, job_id, base64(plain_proof)]``
+            (worker = the authorize username ``wallet.worker``).
+          * client-first (HeroMiners): object
+            ``params = {"job_id": …, "plain_proof": base64(plain_proof)}``.
 
-        Returns the JSON-RPC response object (with ``result``/``error`` keys).
-        Note: ``result: true`` from the pool only means "params parsed";
-        proof validation happens asynchronously and surfaces in pool stats,
-        not in this response.
+        Returns the JSON-RPC response object (``result``/``error``). A
+        ``result: true`` only means the params parsed; proof validation is
+        async (surfaces in pool stats / a later error, not this response).
         """
         import base64
-        user = f"{self.cfg.address}.{self.cfg.worker}" if self.cfg.worker else self.cfg.address
         proof_b64 = base64.b64encode(plain_proof).decode("ascii")
-        return self._call("mining.submit", [user, job_id, proof_b64], timeout=30.0)
+        if self.dialect == "client":
+            params: Any = {"job_id": job_id, "plain_proof": proof_b64}
+        else:
+            user = f"{self.cfg.address}.{self.cfg.worker}" if self.cfg.worker else self.cfg.address
+            params = [user, job_id, proof_b64]
+        return self._call("mining.submit", params, timeout=30.0)
 
 
 # --------------------------------------------------------------------------- #

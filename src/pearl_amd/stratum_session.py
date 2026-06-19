@@ -56,13 +56,37 @@ class Work:
 
 
 def _parse_notify(job: Job) -> dict[str, Any]:
-    """Decode the positional ``mining.notify`` params into named fields.
+    """Decode ``mining.notify`` params into named fields, both wire forms:
 
-    Field order confirmed by live capture; see ``docs/pearl-stratum-protocol.md``.
+      * positional pearl/v1 array (AlphaPool):
+        ``[job_id, prev_hash, header, height, ntime, nbits, clean]`` — no target.
+      * object (HeroMiners / Akoya pearl-stratum):
+        ``{job_id, header, target, height}`` — carries the share ``target``
+        directly (hex, big-endian), so ``explicit_target`` is set.
+
+    See ``docs/pearl-stratum-protocol.md`` and Akoya StratumSession ParseArrayNotify
+    / StratumNotifyParams.
     """
-    if not isinstance(job.raw, list) or len(job.raw) < 7:
-        raise ValueError(f"unexpected mining.notify payload: {job.raw!r}")
-    job_id, prev_hex, header_hex, height, ntime_hex, nbits_hex, clean = job.raw[:7]
+    raw = job.raw
+    if isinstance(raw, dict):
+        header_hex = str(raw.get("header") or raw.get("incomplete_header") or "")
+        out: dict[str, Any] = {
+            "job_id": str(raw.get("job_id") or raw.get("id") or ""),
+            "prev_hash": bytes.fromhex(raw["prev_hash"]) if raw.get("prev_hash") else b"",
+            "incomplete_header_bytes": bytes.fromhex(header_hex) if header_hex else b"",
+            "block_height": int(raw.get("height") or 0),
+            "ntime_hex": str(raw.get("ntime") or ""),
+            "share_nbits": str(raw.get("nbits") or ""),
+            "clean_jobs": bool(raw.get("clean_jobs") if raw.get("clean_jobs") is not None
+                               else raw.get("clean") or False),
+        }
+        tgt = raw.get("target")
+        if tgt not in (None, ""):
+            out["explicit_target"] = int(str(tgt), 16) if isinstance(tgt, str) else int(tgt)
+        return out
+    if not isinstance(raw, list) or len(raw) < 7:
+        raise ValueError(f"unexpected mining.notify payload: {raw!r}")
+    job_id, prev_hex, header_hex, height, ntime_hex, nbits_hex, clean = raw[:7]
     return {
         "job_id": str(job_id),
         "prev_hash": bytes.fromhex(prev_hex),
@@ -129,6 +153,30 @@ class StratumSession:
         client.connect()
         client.handshake()
         self._client = client
+        if client.dialect == "client":
+            self._inject_declared_shape()
+
+    def _inject_declared_shape(self) -> None:
+        """Client-first pools (HeroMiners) don't send ``pearl.set_mining_params``
+        — the miner DECLARES the canonical mainnet shape (committed in job_key /
+        config_bytes and validated server-side). rows=[0,32]/cols=[0..63] match
+        exactly what the coopmat kernel XORs per tile (row tid and tid+32 over 64
+        cols), so the committed hash-tile pattern matches the GPU output."""
+        cfg = self.cfg
+        params = {
+            "m": cfg.declared_m, "n": cfg.declared_n,
+            "k": cfg.declared_k, "rank": cfg.declared_rank,
+            "rows_pattern": [0, 32], "cols_pattern": list(range(64)),
+            "mma_type": "Int7xInt7ToInt32",
+        }
+        with self._lock:
+            self._latest_params = params
+            self._param_change_count += 1
+        self._on_log(
+            f"  [session] declared shape (client-first) m={params['m']} "
+            f"n={params['n']} k={params['k']} rank={params['rank']}"
+        )
+        self._maybe_emit_work()
 
     def stop(self) -> None:
         if self._client is not None:
@@ -183,9 +231,12 @@ class StratumSession:
 
     def _maybe_emit_work(self) -> None:
         with self._lock:
-            if (self._latest_notify is None
-                    or self._latest_params is None
-                    or self._latest_diff is None):
+            if self._latest_notify is None or self._latest_params is None:
+                return
+            # Need *some* difficulty source: set_difficulty (array-notify pools)
+            # OR an explicit target in the notify (object-notify pools).
+            if (self._latest_diff is None
+                    and self._latest_notify.get("explicit_target") is None):
                 return
             params = dict(self._latest_params)
             header = self._latest_notify["incomplete_header_bytes"]

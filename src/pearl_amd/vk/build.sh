@@ -30,8 +30,9 @@ echo "compiling jackpot_vk.dll (static CRT for ctypes)..."
 echo "done -> $(pwd)/jackpot_vk.dll"
 
 # --- amortized-GEMM + cooperative_matrix path (RDNA3 tensor cores) ---
-echo "compiling coopmat shaders (pmat + jackpot_coopmat, r=64,128)..."
-for r in 64 128; do
+echo "compiling coopmat shaders (pmat + jackpot_coopmat, r=64,128,256)..."
+# r=256 is the HeroMiners-family (stratum-mainnet) noise_rank; r=128 is AlphaPool.
+for r in 64 128 256; do
   "$GLSLC" --target-env=vulkan1.3 -DPEARL_R=$r pmat.comp -o "pmat_r${r}.spv"
   # WG=256 + requiredSubgroupSize=32 (wave32) is the tuned production config.
   "$GLSLC" --target-env=vulkan1.3 -DPEARL_R=$r -DWG=256 jackpot_coopmat.comp \

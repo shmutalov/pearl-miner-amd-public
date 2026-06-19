@@ -20,7 +20,7 @@ REM ----- Pool (HeroMiners, TLS). Pick the region nearest you; others:
 REM        ca.pearl.herominers.com / de.pearl.herominers.com /
 REM        sg.pearl.herominers.com / br.pearl.herominers.com (port 1200, TLS).
 REM        Always confirm the current host/port on the pool's own site. -----
-set "POOL_HOST=ca.pearl.herominers.com"
+set "POOL_HOST=us2.pearl.herominers.com"
 set "POOL_PORT=1200"
 
 REM ----- coopmat: distinct shares to find+submit per round -----
@@ -49,10 +49,13 @@ echo   Path   : coopmat (tensor cores) + submit
 echo.
 
 REM  --tls: HeroMiners serves stratum over TLS on port 1200.
-REM  --password "x;d=1": request the lowest difficulty the pool allows so the
-REM  (correct, pdiff) share target is reachable; HeroMiners vardiff may raise it.
-REM  Drop the --password arg entirely to let the pool's vardiff manage it.
-"%PY%" src\scripts\35_run_miner_live.py --host "%POOL_HOST%" --port %POOL_PORT% --tls --address "%ADDRESS%" --worker "%WORKER%" --coopmat --coopmat-batch %COOPMAT_BATCH% --max-hits %MAX_HITS% --observe-seconds %OBSERVE_SECONDS% --submit --password "x;d=1"
+REM  --log-raw: print every inbound stratum line. KEEP THIS for the first runs so
+REM  the real handshake/notify format is captured (client-first object dialect,
+REM  rank-256 shape are auto-applied; verify against the live log). Remove once
+REM  shares are credited to cut log noise.
+REM  --password is ignored by the client-first (object authorize) dialect;
+REM  HeroMiners manages difficulty via vardiff.
+"%PY%" src\scripts\35_run_miner_live.py --host "%POOL_HOST%" --port %POOL_PORT% --tls --address "%ADDRESS%" --worker "%WORKER%" --coopmat --coopmat-batch %COOPMAT_BATCH% --max-hits %MAX_HITS% --observe-seconds %OBSERVE_SECONDS% --submit --log-raw
 
 echo.
 echo   Miner exited (code %ERRORLEVEL%).
