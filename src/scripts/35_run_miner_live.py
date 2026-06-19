@@ -48,6 +48,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="eu1.alphapool.tech")
     ap.add_argument("--port", type=int, default=5566)
+    ap.add_argument("--tls", action="store_true",
+                    help="wrap the connection in TLS (HeroMiners/Kryptex use "
+                         "stratum+tls://; AlphaPool is plain TCP)")
     ap.add_argument("--address", required=True,
                     help="Pearl wallet (prl1…)")
     ap.add_argument("--worker", default="rx570")
@@ -101,7 +104,7 @@ def main() -> int:
     cfg = StratumConfig(
         host=args.host, port=args.port,
         address=args.address, worker=args.worker, password=args.password,
-        log_raw=args.log_raw,
+        log_raw=args.log_raw, tls=args.tls,
     )
 
     stop_evt = threading.Event()

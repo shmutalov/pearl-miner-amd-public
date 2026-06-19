@@ -33,6 +33,7 @@ import json
 import multiprocessing as mp
 import os
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -159,6 +160,8 @@ class StratumConfig:
     solver_workers: int | None = None  # CPU solver only
     connect_timeout_sec: float = 15.0
     log_raw: bool = False            # log every inbound JSON-RPC line (share verdicts)
+    tls: bool = False                # wrap the socket in TLS (HeroMiners/Kryptex
+                                     # use stratum+tls://; AlphaPool is plain TCP)
 
 
 class StratumClient:
@@ -195,9 +198,18 @@ class StratumClient:
     def connect(self) -> None:
         s = socket.create_connection((self.cfg.host, self.cfg.port),
                                      timeout=self.cfg.connect_timeout_sec)
+        if self.cfg.tls:
+            # Mining pools serve TLS with certs that won't chain to a public CA
+            # (the ARC docs note "certs accepted pool-style; no CA needed"), so
+            # don't verify — but still send SNI so host-routed pools answer.
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            s = ctx.wrap_socket(s, server_hostname=self.cfg.host)
         s.settimeout(None)
         self._sock = s
-        self._on_log(f"connected host={self.cfg.host} port={self.cfg.port}")
+        self._on_log(f"connected host={self.cfg.host} port={self.cfg.port}"
+                     f"{' (TLS)' if self.cfg.tls else ''}")
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
 
