@@ -267,16 +267,29 @@ class StratumSession:
                 # ban; a brief pdiff-only fix dropped the DAF (2^19 too STRICT).
                 # diff_target * DAF is the correct middle (lz~28 at D=50000, which
                 # matches the lz~29 share we saw accepted).
+                # Precedence (mirrors Akoya): a per-worker vardiff
+                # set_difficulty OVERRIDES the notify target. On HeroMiners the
+                # notify "target" is the high network/block target (D~2e6); the
+                # real, much-easier SHARE target arrives via set_difficulty. So
+                # prefer set_difficulty when present, then the notify target,
+                # then a diff=1 fallback.
                 DIFF1_TARGET = 0xFFFF << 208
                 explicit = self._latest_notify.get("explicit_target")
-                if explicit is not None:
-                    diff_target = int(explicit)
-                elif self._latest_diff and float(self._latest_diff) > 0:
+                if self._latest_diff and float(self._latest_diff) > 0:
                     diff_target = max(1, DIFF1_TARGET // int(float(self._latest_diff)))
+                    src = f"set_difficulty D={self._latest_diff}"
+                elif explicit is not None:
+                    diff_target = int(explicit)
+                    src = "notify.target"
                 else:
-                    diff_target = DIFF1_TARGET          # diff=1 fallback
+                    diff_target = DIFF1_TARGET
+                    src = "diff=1 fallback"
                 daf = mining_config.difficulty_adjustment_factor()
                 target = min(diff_target * daf, (1 << 256) - 1)
+                self._on_log(
+                    f"  [session] share target: {src}, DAF={daf} -> "
+                    f"target_lz={256 - target.bit_length()} "
+                    f"(diff_target_lz={256 - diff_target.bit_length()})")
             except Exception as e:
                 self._on_log(f"  [session] failed to derive share target: {e!r}")
                 return
