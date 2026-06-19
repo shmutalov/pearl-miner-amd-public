@@ -90,8 +90,17 @@ void main() {
         // 16 output tiles split round-robin across subgroups.
         for (uint t = sg; t < 16u; t += nsub) {
             uint mt = t >> 2, nt = t & 3u;
-            coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
-                coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+            // CUMULATIVE accumulator (matches Akoya/ARC JackpotComputer): the
+            // GEMM tile is the running partial-sum over ALL columns [0, k0+R),
+            // not just this R-slice. Seed acc from the cumulative tile in Gs
+            // (iter>0); only iter 0 starts from zero. The per-slice variant
+            // (acc reset to 0 every iter) produced wrong jackpot words -> rejects.
+            coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
+            if (iter == 0)
+                acc = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+            else
+                coopMatLoad(acc, Gs, (mt * 16u) * BLOCK + nt * 16u, uint(BLOCK),
+                            gl_CooperativeMatrixLayoutRowMajor);
             for (uint kt = 0; kt < uint(PEARL_R) / 16u; ++kt) {
                 coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma;
                 coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;

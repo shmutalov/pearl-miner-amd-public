@@ -208,17 +208,21 @@ def compute_jackpot(secret_a: np.ndarray, secret_b: np.ndarray,
     if noise_a.shape != (h, k) or noise_b.shape != (w, k):
         raise ValueError("noise shape mismatch")
 
-    # Accumulate as int32: each cell = sum over l in [ll-r, ll) of
-    # (secret_a[u, l] + noise_a[u, l]) * (secret_b[v, l] + noise_b[v, l]).
-    sa = secret_a.astype(np.int32) + noise_a.astype(np.int32)
-    sb = secret_b.astype(np.int32) + noise_b.astype(np.int32)
+    # CUMULATIVE accumulator, matching the reference Akoya/ARC JackpotComputer:
+    # `tile` is zeroed ONCE and summed over ALL columns [0, ll) up to each
+    # r-boundary (a running partial-GEMM sum), NOT recomputed per r-slice. At
+    # each boundary the running tile is XOR-folded into the rotating message
+    # word. (The old per-slice variant — block = sa[:,ll-r:ll] @ ... reset every
+    # iter — produced different words and was the cause of pool rejections.)
+    sa = secret_a.astype(np.int64) + noise_a.astype(np.int64)
+    sb = secret_b.astype(np.int64) + noise_b.astype(np.int64)
 
     jackpot_msg = np.zeros(JACKPOT_SIZE, dtype=np.uint32)
+    tile = np.zeros((h, w), dtype=np.int64)
     for ll in range(r, k + 1, r):
-        # int32 GEMM on the [ll-r, ll) slice; result shape (h, w)
-        block = sa[:, ll - r:ll] @ sb[:, ll - r:ll].T
-        # XOR all values together (uint32 mod 2^32 — same as int32 mod 2^32)
-        xored_tile = np.bitwise_xor.reduce(block.flatten().view(np.uint32))
+        tile += sa[:, ll - r:ll] @ sb[:, ll - r:ll].T          # running cumulative sum
+        # low 32 bits == reference int32 accumulate-and-wrap, then XOR-reduce
+        xored_tile = np.bitwise_xor.reduce(tile.astype(np.uint32).flatten())
         tid = ((ll // r) - 1) % JACKPOT_SIZE
         jackpot_msg[tid] = _rotl32(int(jackpot_msg[tid]), LROT_PER_TILE) ^ int(xored_tile)
     return jackpot_msg

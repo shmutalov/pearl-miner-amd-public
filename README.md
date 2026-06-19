@@ -254,6 +254,23 @@ Research harness, oracle, and per-phase validators live in
   spec-quality test vectors.
 - The Decred developers for the consensus / SPV building blocks Pearl
   builds on.
+- **[Akoya miner](https://github.com/akoyapool/akoya-miner)** — the original
+  open-source Pearl miner (C# host + native CUDA/HIP GEMM + Rust `pearl-blake3`).
+  Its `Akoya.Crypto` is the canonical reference for the PoW: deterministic
+  keyed-BLAKE3 noise (`NoiseGenerator`), the jackpot accumulator
+  (`JackpotComputer`), the keyed-Merkle inclusion proofs (`MerkleProofBuilder`),
+  and the commitment-seed derivation. Cross-checking against it pinned the
+  jackpot accumulator semantics — the tile is the **cumulative** running
+  partial-GEMM sum over `[0, ll)` folded at each `rank`-block boundary, *not* the
+  per-`rank`-slice block — which was the cause of our shares being pool-rejected.
+- **[ARC-miner](https://github.com/jbman2025/ARC-miner)** — the Intel-Arc-first,
+  0%-dev-fee (GPL-3.0) port of Akoya, with NVIDIA/AMD support. Cross-referenced
+  for the same `Akoya.Crypto` primitives and the stratum/V2 share format.
+
+> Both Akoya and ARC are independent implementations of the same Pearl protocol;
+> this project reuses none of their (C#/Rust) source — it was written from the
+> protocol + the reverse-engineered reference binary — but their open source was
+> invaluable for validating our crypto bit-for-bit.
 
 ## Donations
 
