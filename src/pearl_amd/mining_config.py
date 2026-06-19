@@ -205,6 +205,23 @@ class MiningConfiguration:
             raise AssertionError(f"serialized size {len(out)} != {MINING_CONFIG_SERIALIZED_SIZE}")
         return bytes(out)
 
+    def dot_product_length(self) -> int:
+        """Protocol dot-product length used by per-tile target scaling: the
+        common dimension floored to the MMA quantum (128 for Int7xInt7ToInt32).
+        Mirrors Akoya ``MiningConfiguration.DotProductLength`` (floor-div)."""
+        quantum = 128 if self.mma_type == MMA_TYPE_INT7XINT7_TO_INT32 else 128
+        return (self.common_dim // quantum) * quantum
+
+    def difficulty_adjustment_factor(self) -> int:
+        """Per-tile difficulty scale: ``rows.size * cols.size * dot_product_length``.
+        Each found tile represents this many MACs, so the protocol scales the
+        share target UP by it: the miner's real target = ``diff_target * DAF``.
+        Mirrors Akoya ``MiningConfiguration.DifficultyAdjustmentFactor`` and the
+        ``adjusted = diffTarget * DAF`` in Akoya ``GpuWorker.InstallSigmaHalf``.
+        For the live shape (rows=2, cols=64, k=4096) this is 2*64*4096 = 2^19."""
+        return (self.rows_pattern.size() * self.cols_pattern.size()
+                * self.dot_product_length())
+
     @classmethod
     def from_bytes(cls, data: bytes) -> "MiningConfiguration":
         if len(data) != MINING_CONFIG_SERIALIZED_SIZE:

@@ -196,26 +196,36 @@ class StratumSession:
                 self._on_log(f"  [session] failed to derive mining_config/job_key: {e!r}")
                 return
             try:
-                # Share target = classic stratum pdiff, VERIFIED end-to-end by
-                # ARC-miner on alphapool (shares credited, no shim):
-                #     Diff1Target = 0xFFFF << 208  (~2^224)
-                #     target      = Diff1Target / D        (D from set_difficulty)
-                # The previous code shifted this LEFT by 32 (`_raw << 32`), which
-                # was WRONG: it conflated the pool's HASHRATE ACCOUNTING (it credits
-                # ~2^32 hash-equivalents per attempt when *estimating* your TH/s)
-                # with the SHARE-VALIDITY target (consensus). That made us search
-                # 2^32 too loose. The pdiff floor proves it: even D=1 has the top
-                # 32 target bits zero, so ANY valid share needs >=32 leading-zero
-                # bits; the <<32 accepted hits at lz~15-29 -> every share below the
-                # minimum valid difficulty -> pool "too many bad proofs" -> ban.
-                # (cross-check: ARC StratumSession.DifficultyToNbits, Diff1Target.)
+                # Per-tile share target (Akoya/ARC):  target = diff_target * DAF.
+                #
+                #   diff_target — the pdiff target for the current difficulty:
+                #     * object-notify pools (HeroMiners) carry it directly in the
+                #       notify ("explicit_target");
+                #     * pearl/v1 array-notify pools (AlphaPool) carry NO target, so
+                #       synthesize it from the last set_difficulty:
+                #           diff_target = Diff1Target / D,  Diff1Target = 0xFFFF<<208.
+                #
+                #   DAF = rows.size * cols.size * dot_product_length  (= 2^19 for the
+                #     live shape: 2*64*4096). Each found tile is one "attempt"
+                #     representing that many MACs, so the protocol scales the target
+                #     UP by it. Akoya GpuWorker.InstallSigmaHalf: adjusted =
+                #     NbitsToTarget(nbits) * DifficultyAdjustmentFactor().
+                #
+                # History: the old `nbits<<32` (factor 2^32) was 2^13 too LOOSE vs
+                # the DAF and submitted sub-target garbage -> "too many bad proofs"
+                # ban; a brief pdiff-only fix dropped the DAF (2^19 too STRICT).
+                # diff_target * DAF is the correct middle (lz~28 at D=50000, which
+                # matches the lz~29 share we saw accepted).
                 DIFF1_TARGET = 0xFFFF << 208
-                D = self._latest_diff
-                if D and float(D) > 0:
-                    target = max(1, DIFF1_TARGET // int(float(D)))
+                explicit = self._latest_notify.get("explicit_target")
+                if explicit is not None:
+                    diff_target = int(explicit)
+                elif self._latest_diff and float(self._latest_diff) > 0:
+                    diff_target = max(1, DIFF1_TARGET // int(float(self._latest_diff)))
                 else:
-                    # No set_difficulty yet — fall back to the notify nbits as-is.
-                    target = nbits_hex_to_target(self._latest_notify["share_nbits"])
+                    diff_target = DIFF1_TARGET          # diff=1 fallback
+                daf = mining_config.difficulty_adjustment_factor()
+                target = min(diff_target * daf, (1 << 256) - 1)
             except Exception as e:
                 self._on_log(f"  [session] failed to derive share target: {e!r}")
                 return
