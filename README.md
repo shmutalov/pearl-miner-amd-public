@@ -5,27 +5,37 @@ gfx803) via OpenCL — the cheapest 8 GiB cards nobody wants — and now runs th
 hot path on **RDNA3** (RX 7900 XT, gfx1100) tensor cores via Vulkan
 `cooperative_matrix`. Just-for-fun research project.
 
-> **Status: it earns.** The full pipeline runs against real pool stratum
+> **Status: submits shares, but pool acceptance is NOT yet confirmed — this
+> miner does not (yet) earn.** The full pipeline runs against real pool stratum
 > (`eu1.alphapool.tech:5566`) — handshake, BLAKE3 challenge, mining params,
-> per-job preflight, GPU candidate search, PlainProof assembly, share submit —
-> and **submits shares the pool accepts** (validated live: 40/40 accepted,
-> continuously). The amortized-GEMM + cooperative_matrix evaluator hits
-> **~37–38 M candidates/s on an RX 7900 XT** (~37 TH/s by the protocol's
-> `attempts × 2³² / s` metric). Every stage is mathematically correct and
-> bit-identical to the reference Rust implementation.
+> per-job preflight, GPU candidate search, PlainProof assembly, share submit.
+> The pool returns `result:true` to each submit, but that only means **parsed
+> and queued**, not credited: as of 2026-06-19 the dashboard shows **zero
+> accepted shares**, and a burst of submits drew a
+> `[25,"too many bad proofs; temporary ban"]` — so the proofs are still being
+> rejected by the pool's async validation. Root-cause debugging is ongoing
+> (see the acknowledgements + notes below).
 >
-> Getting there required two correctness fixes that the small-shape tests had
-> masked (both now fixed + verified at the live pool's `rank=128`):
-> - **perm `noise_rank`** used `NOISE_RANGE//2` (=64) instead of `r` → wrong
->   noise (= invalid proofs) whenever `rank ≠ 64`.
-> - **share target** is `2²⁵⁶/D = nbits_target << 32`, *not* the raw `nbits`
->   target. Pearl credits each attempt as `H_per_attempt = 2³²` hash-equivalents,
->   so a share is accepted when `2²⁵⁶/hash ≥ D`. Searching at the raw target was
->   2³² too strict and found ~nothing; the scaled target makes expected
->   candidates/share = `D` (≈ a few ms of GPU time).
+> What *is* real and measured is GPU throughput: the amortized-GEMM +
+> cooperative_matrix evaluator hits **~37–38 M candidate-jackpots/s on an
+> RX 7900 XT** (≈ 37 TH/s by the protocol's `attempts × 2³² / s` *display*
+> metric). That is raw evaluator throughput — **not** an accepted-share rate.
 >
-> Economics are still modest — one 7900 XT is a small contributor, roughly
-> break-even on power — but it produces *accepted* shares, which is the point.
+> Correctness fixes made while chasing acceptance — each cross-checked
+> bit-for-bit against the Akoya/ARC reference, but **none yet confirmed by a
+> credited share**:
+> - **jackpot fold**: the tile must be the **cumulative** running partial-GEMM
+>   sum folded at each `rank`-block boundary, not the per-`rank`-slice block
+>   (matches Akoya `JackpotComputer`).
+> - **perm `noise_rank`** must use `r`, not `NOISE_RANGE//2` (=64) — wrong noise
+>   whenever `rank ≠ 64`.
+> - **share target** is the classic stratum pdiff `(0xFFFF<<208)/D ≈ 2²²⁴/D`
+>   (matches ARC-miner, which *is* credited on this pool). An earlier version
+>   shifted it left 32 bits (`2²⁵⁶/D`), conflating the pool's hashrate
+>   *accounting* (~2³² hash-equivalents credited per attempt) with the
+>   share-*validity* target — making every hit ~2³² too easy (below even the
+>   D=1 floor of 32 leading-zero bits). That was the direct cause of the
+>   "bad proofs" ban.
 
 ## What's interesting here
 
@@ -135,9 +145,10 @@ python -m venv .venv
     --max-attempts-per-job 100000
 ```
 
-On an RX 7900 XT, build the Vulkan bits once and mine on tensor cores —
-this submits accepted shares continuously (omit `d` in the password to let
-the pool's VarDiff pick the difficulty):
+On an RX 7900 XT, build the Vulkan bits once and mine on tensor cores — this
+submits shares to the pool continuously (**acceptance not yet confirmed — see
+Status**). Request a low difficulty so the pdiff share target is reachable,
+e.g. `--password "x;d=1"`:
 
 ```bash
 bash src/pearl_amd/vk/build.sh        # one-time: glslc + MinGW g++
@@ -157,9 +168,9 @@ OpenCL, then CPU if unavailable).
   local Merkle+jackpot verifier. The pool does that; locally we only
   check that our `PlainProof` round-trips byte-identically through the
   bincode codec.
-- **VarDiff**: we honor whatever difficulty the pool assigns (omit `d` in the
-  password) and search against the correctly-scaled share target, but don't
-  otherwise adjust strategy based on it.
+- **VarDiff**: we honor whatever difficulty the pool assigns (or request a fixed
+  `d` in the password) and search against the pdiff share target
+  `(0xFFFF<<208)/D`, but don't otherwise adjust strategy based on it.
 - **No multi-GPU**: single device only.
 - **Coopmat is pattern-specialized**: the tensor-core kernel hardcodes the live
   pool's `rows=[0,32]`/`cols=[0..63]` tile geometry; other patterns fall back to
@@ -238,7 +249,8 @@ gitignored), each a ctypes drop-in selected by a miner flag:
   display metric (`attempts × 2³² / s / 1e12`), 37 M cand/s ≈ **37 TH/s**.
 
 The whole chain is validated bit-identical to `evaluate_candidate` at the pool
-shape, and end-to-end against the live pool (accepted shares). Build:
+shape, and runs end-to-end against the live pool (submits shares; **pool
+acceptance not yet confirmed — see Status**). Build:
 
 ```bash
 bash src/pearl_amd/vk/build.sh    # needs LunarG Vulkan SDK (glslc) + MinGW g++
@@ -262,7 +274,7 @@ Research harness, oracle, and per-phase validators live in
   and the commitment-seed derivation. Cross-checking against it pinned the
   jackpot accumulator semantics — the tile is the **cumulative** running
   partial-GEMM sum over `[0, ll)` folded at each `rank`-block boundary, *not* the
-  per-`rank`-slice block — which was the cause of our shares being pool-rejected.
+  per-`rank`-slice block — one of the bugs behind our pool-rejected shares.
 - **[ARC-miner](https://github.com/jbman2025/ARC-miner)** — the Intel-Arc-first,
   0%-dev-fee (GPL-3.0) port of Akoya, with NVIDIA/AMD support. Cross-referenced
   for the same `Akoya.Crypto` primitives and the stratum/V2 share format.
